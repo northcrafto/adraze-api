@@ -360,6 +360,19 @@ rutt('POST', '/auth/logout', (req, res) => {
   return {};
 });
 
+// Publik summa för alla användare (statistiksidan). Räknas om högst var 30:e sekund.
+let globalt = { tid: 0, data: null };
+rutt('GET', '/stats/global', () => {
+  if (now() - globalt.tid < 30_000) return globalt.data;
+  const summa = FALT.map((f) => `COALESCE(SUM(${f}),0) AS ${f}`).join(',');
+  const idag = new Date().toISOString().slice(0, 10);
+  globalt = { tid: now(), data: {
+    totalt: q(`SELECT ${summa} FROM stats`).get(),
+    idag: q(`SELECT ${summa} FROM stats WHERE day=?`).get(idag),
+    webblasare: q('SELECT COUNT(*) AS n FROM devices WHERE last_sync>?').get(now() - 30 * 86_400_000).n,
+  } };
+  return globalt.data;
+});
 rutt('GET', '/me', (req) => { const u = kravInloggad(req); return { me: mig(u), ...statistik(u.id) }; });
 
 rutt('POST', '/me/delete', async (req, res, b) => {
