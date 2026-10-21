@@ -1,7 +1,7 @@
 // AdRaze konto-API (doxing, systemd --user adraze-api, 127.0.0.1:8492, publikt som https://api.adraze.app via Cloudflare-tunneln)
 // Konton med lösenord + 6-siffrig kod i mejlet (registrering, ny enhet, glömt lösenord), Google-inloggning,
 // och statistik som AdRaze-tillägget skickar in (hur mycket reklam, spårare och popups det stoppat).
-// Ren Node 22 utan beroenden: node:sqlite, mejl via Cloudflare Email Sending.
+// Ren Node 22 utan beroenden: node:sqlite, mejl via Brevo.
 'use strict';
 const http = require('node:http');
 const crypto = require('node:crypto');
@@ -17,8 +17,7 @@ for (const rad of (fs.existsSync(path.join(DIR, '.env')) ? fs.readFileSync(path.
 const PORT = Number(process.env.PORT || 8492);
 const SAJT = (process.env.SITE_URL || 'https://adraze.app').replace(/\/$/, '');
 const ORIGINS = new Set((process.env.ORIGINS || 'https://adraze.app').split(',').map((s) => s.trim()));
-const CF_TOKEN = process.env.CF_API_TOKEN || '';
-const CF_ACCOUNT = process.env.CF_ACCOUNT_ID || '';
+const BREVO_KEY = process.env.BREVO_API_KEY || '';
 const MAIL_FROM = process.env.MAIL_FROM || 'konto@adraze.app';
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 const COOKIE = 'adr_s'; // inloggning
@@ -79,14 +78,14 @@ setInterval(() => { const t = now(); for (const [k, v] of traffar) if (!v.some((
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 async function skickaMejl(till, amne, html, text) {
-  // MAIL_LOGG=1: skriv koden i loggen i stället för att skicka (tills Cloudflare Email Sending är påslaget)
-  if (process.env.MAIL_LOGG === '1' || !CF_TOKEN || !CF_ACCOUNT) { console.log('[mejl loggat]', till, amne); return process.env.MAIL_LOGG === '1'; }
-  const r = await fetch(`https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT}/email/sending/send`, {
+  // MAIL_LOGG=1: skriv mejlet i loggen i stället för att skicka (för test utan riktiga utskick)
+  if (process.env.MAIL_LOGG === '1' || !BREVO_KEY) { console.log('[mejl loggat]', till, amne); return process.env.MAIL_LOGG === '1'; }
+  const r = await fetch('https://api.brevo.com/v3/smtp/email', {
     method: 'POST',
-    headers: { authorization: `Bearer ${CF_TOKEN}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ to: till, from: { address: MAIL_FROM, name: 'AdRaze' }, subject: amne, html, text }),
+    headers: { 'api-key': BREVO_KEY, 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify({ sender: { email: MAIL_FROM, name: 'AdRaze' }, to: [{ email: till }], subject: amne, htmlContent: html, textContent: text }),
   }).catch((e) => ({ ok: false, status: 0, text: async () => String(e) }));
-  if (!r.ok) console.error('Cloudflare-mejl', r.status, (await r.text()).slice(0, 400));
+  if (!r.ok) console.error('Brevo-mejl', r.status, (await r.text()).slice(0, 400));
   return r.ok;
 }
 
