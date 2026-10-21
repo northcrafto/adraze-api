@@ -1,0 +1,12 @@
+[Unit]
+Description=AdRaze konto-API (konton, inloggning, statistik från tillägget)
+After=network-online.target
+
+[Service]
+WorkingDirectory=/home/doxed/adraze-api
+ExecStart=/usr/bin/node --no-warnings server.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
