@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS stats(device_id INTEGER NOT NULL REFERENCES devices(i
   reklam INTEGER NOT NULL DEFAULT 0, sparare INTEGER NOT NULL DEFAULT 0, farliga INTEGER NOT NULL DEFAULT 0,
   popups INTEGER NOT NULL DEFAULT 0, omdirigeringar INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(device_id, day));`);
 const q = (sql) => db.prepare(sql);
+// Samma tillägg (installation) får bara räknas en gång, även om det kopplas om till ett annat konto
+if (!q("SELECT 1 FROM pragma_table_info('devices') WHERE name='install_id'").get()) db.exec('ALTER TABLE devices ADD COLUMN install_id TEXT');
 
 // ---------- hjälpare ----------
 const now = () => Date.now();
@@ -411,6 +413,12 @@ rutt('POST', '/stats/sync', async (req, res, b) => {
   for (const [dag, v] of dagar) {
     if (!DAG_RE.test(dag) || dag > idag || !v || typeof v !== 'object') continue;
     spara.run(d.id, dag, ...FALT.map((f) => Math.max(0, Math.min(10_000_000, Math.floor(Number(v[f]) || 0)))));
+  }
+  const install = typeof b.installId === 'string' && /^[0-9a-f-]{36}$/.test(b.installId) ? b.installId : null;
+  if (install) {
+    // Tillägget har kopplats om: den gamla kopplingen (och dess dubbletter av samma siffror) tas bort
+    q('DELETE FROM devices WHERE install_id=? AND id<>?').run(install, d.id);
+    q('UPDATE devices SET install_id=? WHERE id=?').run(install, d.id);
   }
   q('UPDATE devices SET last_sync=? WHERE id=?').run(now(), d.id);
   return {};
