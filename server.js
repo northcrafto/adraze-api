@@ -79,7 +79,12 @@ setInterval(() => { const t = now(); for (const [k, v] of traffar) if (!v.some((
 // ---------- mejl ----------
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+const MAIL_PER_DAG = Number(process.env.MAIL_PER_DAG || 150);
+let mejlIdag = { dag: '', n: 0 };
 async function skickaMejl(till, amne, html, text) {
+  const dag = new Date().toISOString().slice(0, 10);
+  if (mejlIdag.dag !== dag) mejlIdag = { dag, n: 0 };
+  if (++mejlIdag.n > MAIL_PER_DAG) { console.error('Mejltaket nått för i dag'); return false; }
   // MAIL_LOGG=1: skriv mejlet i loggen i stället för att skicka (för test utan riktiga utskick)
   if (process.env.MAIL_LOGG === '1' || !BREVO_KEY) { console.log('[mejl loggat]', till, amne); return process.env.MAIL_LOGG === '1'; }
   const r = await fetch('https://api.brevo.com/v3/smtp/email', {
@@ -219,6 +224,8 @@ async function verifieraGoogle(token) {
 
 // ---------- statistik ----------
 const FALT = ['reklam', 'sparare', 'farliga', 'popups', 'omdirigeringar'];
+// Högsta rimliga antal per webbläsare och dag, så att ingen kan blåsa upp den publika siffran
+const TAK = { reklam: 100_000, sparare: 100_000, farliga: 1_000, popups: 2_000, omdirigeringar: 2_000 };
 const DAG_RE = /^\d{4}-\d{2}-\d{2}$/;
 function statistik(userId) {
   const fran = new Date(now() - 29 * 86_400_000).toISOString().slice(0, 10);
@@ -237,8 +244,10 @@ function skicka(res, status, kropp) {
 }
 function lasKropp(req, max) {
   return new Promise((resolve, reject) => {
+    if (Number(req.headers['content-length']) > max) { req.resume(); return reject(fel(413, 'För stor förfrågan.')); }
     const bitar = []; let n = 0;
-    req.on('data', (c) => { n += c.length; if (n > max) { reject(fel(413, 'För stor förfrågan.')); req.destroy(); } else bitar.push(c); });
+    // För stort: sluta spara men läs klart, så att svaret (413) hinner fram
+    req.on('data', (c) => { n += c.length; if (n > max) { reject(fel(413, 'För stor förfrågan.')); bitar.length = 0; } else bitar.push(c); });
     req.on('end', () => resolve(Buffer.concat(bitar)));
     req.on('error', reject);
   });
@@ -319,6 +328,7 @@ rutt('POST', '/auth/google', async (req, res, b) => {
   if (begransad(`google:${ipAv(req)}`, 20, 900_000)) throw fel(429, 'För många försök. Vänta en stund.');
   const g = await verifieraGoogle(b.credential);
   let u = q('SELECT * FROM users WHERE google_sub=?').get(g.sub) || q('SELECT * FROM users WHERE email=?').get(g.email);
+  if (u && !u.verified) q('UPDATE users SET pass=NULL WHERE id=?').run(u.id);
   if (u) q('UPDATE users SET google_sub=?, verified=1 WHERE id=?').run(g.sub, u.id);
   else q('INSERT INTO users(email,google_sub,verified,created_at) VALUES(?,?,1,?)').run(g.email, g.sub, now());
   u = q('SELECT * FROM users WHERE google_sub=?').get(g.sub);
@@ -366,11 +376,14 @@ rutt('POST', '/auth/logout', (req, res) => {
 let globalt = { tid: 0, data: null };
 rutt('GET', '/stats/global', () => {
   if (now() - globalt.tid < 30_000) return globalt.data;
+  // Samma installation kopplad till flera konton räknas en gång per dag (största värdet)
   const summa = FALT.map((f) => `COALESCE(SUM(${f}),0) AS ${f}`).join(',');
+  const perInstallation = `SELECT s.day, ${FALT.map((f) => `MAX(s.${f}) AS ${f}`).join(',')} FROM stats s JOIN devices d ON d.id=s.device_id
+    GROUP BY COALESCE(d.install_id, 'enhet' || d.id), s.day`;
   const idag = new Date().toISOString().slice(0, 10);
   globalt = { tid: now(), data: {
-    totalt: q(`SELECT ${summa} FROM stats`).get(),
-    idag: q(`SELECT ${summa} FROM stats WHERE day=?`).get(idag),
+    totalt: q(`SELECT ${summa} FROM (${perInstallation})`).get(),
+    idag: q(`SELECT ${summa} FROM (${perInstallation}) WHERE day=?`).get(idag),
     webblasare: q('SELECT COUNT(*) AS n FROM devices WHERE last_sync>?').get(now() - 30 * 86_400_000).n,
   } };
   return globalt.data;
@@ -390,6 +403,7 @@ rutt('POST', '/me/delete', async (req, res, b) => {
 rutt('POST', '/devices', async (req) => {
   const u = kravInloggad(req);
   if (q('SELECT COUNT(*) AS n FROM devices WHERE user_id=?').get(u.id).n >= 20) throw fel(400, 'Du har redan 20 kopplade webbläsare. Ta bort någon först.');
+  if (begransad(`koppla:${u.id}`, 10, 86_400_000)) throw fel(429, 'För många kopplingar i dag. Försök i morgon.');
   const token = crypto.randomBytes(32).toString('base64url');
   const r = q('INSERT INTO devices(user_id,token,name,created_at) VALUES(?,?,?,?)').run(u.id, sha(token), enhetsNamn(req), now());
   return { token, id: Number(r.lastInsertRowid) };
@@ -412,12 +426,13 @@ rutt('POST', '/stats/sync', async (req, res, b) => {
     ON CONFLICT(device_id,day) DO UPDATE SET ${FALT.map((f) => `${f}=MAX(${f},excluded.${f})`).join(',')}`);
   for (const [dag, v] of dagar) {
     if (!DAG_RE.test(dag) || dag > idag || !v || typeof v !== 'object') continue;
-    spara.run(d.id, dag, ...FALT.map((f) => Math.max(0, Math.min(10_000_000, Math.floor(Number(v[f]) || 0)))));
+    spara.run(d.id, dag, ...FALT.map((f) => Math.max(0, Math.min(TAK[f], Math.floor(Number(v[f]) || 0)))));
   }
   const install = typeof b.installId === 'string' && /^[0-9a-f-]{36}$/.test(b.installId) ? b.installId : null;
   if (install) {
-    // Tillägget har kopplats om: den gamla kopplingen (och dess dubbletter av samma siffror) tas bort
-    q('DELETE FROM devices WHERE install_id=? AND id<>?').run(install, d.id);
+    // Tillägget har kopplats om inom kontot: den gamla kopplingen (och dess dubbletter av samma siffror) tas bort.
+    // Andra konton rörs aldrig (id:t kan inte bevisas); den globala summan räknar varje installation en gång i stället.
+    q('DELETE FROM devices WHERE install_id=? AND id<>? AND user_id=?').run(install, d.id, d.user_id);
     q('UPDATE devices SET install_id=? WHERE id=?').run(install, d.id);
   }
   q('UPDATE devices SET last_sync=? WHERE id=?').run(now(), d.id);
