@@ -443,6 +443,8 @@ rutt('POST', '/stats/sync', async (req, res, b) => {
 const STRIPE_KEY = process.env.STRIPE_SECRET_KEY || '';
 const STRIPE_PK = process.env.STRIPE_PUBLISHABLE_KEY || '';
 const STOD_PRODUKT = process.env.STOD_PRODUKT || 'prod_VU2VXsEklH4G9R';
+const STOD_MIN_ORE = 300;
+const STOD_MAX_ORE = 99_999_999;
 const SPRAK = new Set(['sv', 'en', 'nb', 'da', 'fi', 'is', 'de', 'nl', 'fr', 'es', 'pt', 'it', 'pl', 'cs', 'sk', 'hu', 'ro', 'bg', 'el', 'hr', 'sl', 'et', 'lv', 'lt', 'uk', 'tr']);
 
 async function stripe(metod, sokvag, falt) {
@@ -459,8 +461,9 @@ async function stripe(metod, sokvag, falt) {
 rutt('POST', '/stod/kassa', async (req, res, b) => {
   if (!STRIPE_KEY || !STRIPE_PK) throw fel(400, 'Betalning är inte igång just nu.');
   if (begransad(`stod:${ipAv(req)}`, 20, 3_600_000)) throw fel(429, 'För många försök. Vänta en stund.');
-  const belopp = Math.round(Number(b.belopp));
-  if (!Number.isFinite(belopp) || belopp < 20 || belopp > 5000) throw fel(400, 'Välj ett belopp mellan 20 och 5 000 kr.');
+  // Belopp i kronor med upp till två decimaler. Gränserna är Stripes: minst 3 kr, högst 8 siffror i ören
+  const ore = Math.round(Number(b.belopp) * 100);
+  if (!Number.isFinite(ore) || ore < STOD_MIN_ORE || ore > STOD_MAX_ORE) throw fel(400, 'Välj ett belopp mellan 3 och 999 999,99 kr.');
   const sprak = SPRAK.has(b.sprak) ? b.sprak : 'sv';
   const sida = `${SAJT}${sprak === 'sv' ? '' : '/' + sprak}/stod`;
   const s = await stripe('POST', 'checkout/sessions', {
@@ -470,7 +473,7 @@ rutt('POST', '/stod/kassa', async (req, res, b) => {
     locale: 'auto',
     'line_items[0][price_data][currency]': 'sek',
     'line_items[0][price_data][product]': STOD_PRODUKT,
-    'line_items[0][price_data][unit_amount]': String(belopp * 100),
+    'line_items[0][price_data][unit_amount]': String(ore),
     'line_items[0][quantity]': '1',
     'metadata[app]': 'adraze',
     return_url: `${sida}?klar={CHECKOUT_SESSION_ID}`,
@@ -484,7 +487,7 @@ rutt('GET', '/stod/status', async (req) => {
   if (begransad(`stodstatus:${ipAv(req)}`, 60, 3_600_000)) throw fel(429, 'För ofta.');
   const s = await stripe('GET', `checkout/sessions/${id}`);
   if (s.metadata?.app !== 'adraze') throw fel(400, 'Okänd betalning.');
-  return { status: s.status, belopp: Math.round((s.amount_total || 0) / 100) };
+  return { status: s.status, belopp: (s.amount_total || 0) / 100 };
 });
 
 http.createServer(async (req, res) => {
