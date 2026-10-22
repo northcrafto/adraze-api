@@ -81,9 +81,11 @@ setInterval(() => { const t = now(); for (const [k, v] of traffar) if (!v.some((
 // ---------- mejl ----------
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+// Citatförslag från kontosidan går hit
+const FORSLAG_TILL = process.env.FORSLAG_TILL || 'cetoari9@gmail.com';
 const MAIL_PER_DAG = Number(process.env.MAIL_PER_DAG || 150);
 let mejlIdag = { dag: '', n: 0 };
-async function skickaMejl(till, amne, html, text) {
+async function skickaMejl(till, amne, html, text, svaraTill) {
   const dag = new Date().toISOString().slice(0, 10);
   if (mejlIdag.dag !== dag) mejlIdag = { dag, n: 0 };
   if (++mejlIdag.n > MAIL_PER_DAG) { console.error('Mejltaket nått för i dag'); return false; }
@@ -92,7 +94,7 @@ async function skickaMejl(till, amne, html, text) {
   const r = await fetch('https://api.brevo.com/v3/smtp/email', {
     method: 'POST',
     headers: { 'api-key': BREVO_KEY, 'content-type': 'application/json', accept: 'application/json' },
-    body: JSON.stringify({ sender: { email: MAIL_FROM, name: 'AdRaze' }, to: [{ email: till }], subject: amne, htmlContent: html, textContent: text }),
+    body: JSON.stringify({ sender: { email: MAIL_FROM, name: 'AdRaze' }, to: [{ email: till }], subject: amne, htmlContent: html, textContent: text, ...(svaraTill ? { replyTo: { email: svaraTill } } : {}) }),
   }).catch((e) => ({ ok: false, status: 0, text: async () => String(e) }));
   if (!r.ok) console.error('Brevo-mejl', r.status, (await r.text()).slice(0, 400));
   return r.ok;
@@ -401,6 +403,22 @@ rutt('POST', '/me/namn', async (req, res, b) => {
   if (!namn) throw fel(400, 'Skriv ett namn med bokstäver.');
   q('UPDATE users SET namn=? WHERE id=?').run(namn, u.id);
   return { namn };
+});
+
+// Förslag på dagens citat: bara inloggade, högst 5 per timme och konto
+rutt('POST', '/forslag', async (req, res, b) => {
+  const u = kravInloggad(req);
+  if (begransad(`forslag:${u.id}`, 5, 3_600_000)) throw fel(429, 'För många förslag. Vänta en stund.');
+  const citat = String(b.citat || '').replace(/\s+/g, ' ').trim().slice(0, 400);
+  const vem = String(b.vem || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+  if (citat.length < 3) throw fel(400, 'Skriv citatet först.');
+  const ok = await skickaMejl(FORSLAG_TILL, `Citatförslag: ${citat.slice(0, 60)}${citat.length > 60 ? '…' : ''}`,
+    mejlLayout('Nytt citatförslag', mejlText(`<b style="color:#17171a;font-size:18px">”${esc(citat)}”</b>`) +
+      mejlText(vem ? `– ${esc(vem)}` : '<i>Ingen upphovsperson angiven</i>') +
+      mejlText(`Från ${esc(u.email)}${u.namn ? ` (${esc(u.namn)})` : ''}. Svara på mejlet för att svara personen.`)),
+    `Nytt citatförslag:\n\n"${citat}"\n– ${vem || 'okänd'}\n\nFrån ${u.email}`, u.email);
+  if (!ok) throw fel(503, 'Förslaget kunde inte skickas just nu. Försök igen senare.');
+  return {};
 });
 
 rutt('POST', '/me/delete', async (req, res, b) => {
