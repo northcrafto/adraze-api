@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS stats(device_id INTEGER NOT NULL REFERENCES devices(i
 const q = (sql) => db.prepare(sql);
 // Samma tillägg (installation) får bara räknas en gång, även om det kopplas om till ett annat konto
 if (!q("SELECT 1 FROM pragma_table_info('devices') WHERE name='install_id'").get()) db.exec('ALTER TABLE devices ADD COLUMN install_id TEXT');
+// Förnamnet som kontosidan hälsar med ("Välkommen, Cetto")
+if (!q("SELECT 1 FROM pragma_table_info('users') WHERE name='namn'").get()) db.exec('ALTER TABLE users ADD COLUMN namn TEXT');
 
 // ---------- hjälpare ----------
 const now = () => Date.now();
@@ -219,7 +221,7 @@ async function verifieraGoogle(token) {
   const iss = c.iss === 'accounts.google.com' || c.iss === 'https://accounts.google.com';
   if (!giltig || !iss || c.aud !== GOOGLE_CLIENT_ID || c.exp * 1000 < now() || !c.email_verified || !c.sub || !c.email)
     throw fel(401, 'Google-inloggningen kunde inte bekräftas. Försök igen.');
-  return { sub: String(c.sub), email: normEmail(c.email) };
+  return { sub: String(c.sub), email: normEmail(c.email), namn: rensaNamn(c.given_name) };
 }
 
 // ---------- statistik ----------
@@ -267,7 +269,9 @@ const enhetsNamn = (req) => {
 
 const rutter = {};
 const rutt = (metod, p, fn) => { rutter[`${metod} ${p}`] = fn; };
-const mig = (u) => ({ email: u.email, google: !!u.google_sub, losenord: !!u.pass, skapad: u.created_at });
+// Bara bokstäver, mellanslag, bindestreck och apostrof; högst 40 tecken
+const rensaNamn = (n) => String(n || '').normalize('NFC').replace(/[^\p{L}\p{M} '’-]/gu, '').replace(/\s+/g, ' ').trim().slice(0, 40);
+const mig = (u) => ({ email: u.email, namn: u.namn || '', google: !!u.google_sub, losenord: !!u.pass, skapad: u.created_at });
 
 rutt('GET', '/health', () => ({}));
 rutt('GET', '/auth/config', () => ({ googleClientId: GOOGLE_CLIENT_ID || null }));
@@ -331,6 +335,7 @@ rutt('POST', '/auth/google', async (req, res, b) => {
   if (u && !u.verified) q('UPDATE users SET pass=NULL WHERE id=?').run(u.id);
   if (u) q('UPDATE users SET google_sub=?, verified=1 WHERE id=?').run(g.sub, u.id);
   else q('INSERT INTO users(email,google_sub,verified,created_at) VALUES(?,?,1,?)').run(g.email, g.sub, now());
+  if (g.namn) q("UPDATE users SET namn=? WHERE google_sub=? AND COALESCE(namn,'')=''").run(g.namn, g.sub);
   u = q('SELECT * FROM users WHERE google_sub=?').get(g.sub);
   nySession(res, u.id);
   litaPa(res, u.id);
@@ -389,6 +394,14 @@ rutt('GET', '/stats/global', () => {
   return globalt.data;
 });
 rutt('GET', '/me', (req) => { const u = kravInloggad(req); return { me: mig(u), ...statistik(u.id) }; });
+
+rutt('POST', '/me/namn', async (req, res, b) => {
+  const u = kravInloggad(req);
+  const namn = rensaNamn(b.namn);
+  if (!namn) throw fel(400, 'Skriv ett namn med bokstäver.');
+  q('UPDATE users SET namn=? WHERE id=?').run(namn, u.id);
+  return { namn };
+});
 
 rutt('POST', '/me/delete', async (req, res, b) => {
   const u = kravInloggad(req);
