@@ -305,7 +305,7 @@ const kroppMax = {};
 rutt.max = (p, n) => { kroppMax[p] = n; };
 // Bara bokstäver, mellanslag, bindestreck och apostrof; högst 40 tecken
 const rensaNamn = (n) => String(n || '').normalize('NFC').replace(/[^\p{L}\p{M} '’-]/gu, '').replace(/\s+/g, ' ').trim().slice(0, 40);
-const mig = (u) => ({ email: u.email, namn: u.namn || '', avatar: u.avatar || null, google: !!u.google_sub, losenord: !!u.pass, skapad: u.created_at });
+const mig = (u) => ({ email: u.email, namn: u.namn || '', avatar: u.avatar || null, google: !!u.google_sub, losenord: !!u.pass, skapad: u.created_at, pro: !!(u.pro_until && u.pro_until > now()), proTill: u.pro_until || null });
 
 rutt('GET', '/health', () => ({}));
 rutt('GET', '/auth/config', () => ({ googleClientId: GOOGLE_CLIENT_ID || null }));
@@ -424,7 +424,7 @@ rutt('GET', '/stats/global', () => {
   } };
   return globalt.data;
 });
-rutt('GET', '/me', (req) => { const u = kravInloggad(req); return { me: mig(u), ...statistik(u.id) }; });
+rutt('GET', '/me', async (req) => { const u = await pro.uppdatera(kravInloggad(req)); return { me: mig(u), ...statistik(u.id) }; });
 
 rutt('POST', '/me/namn', async (req, res, b) => {
   const u = kravInloggad(req);
@@ -733,6 +733,9 @@ rutt('GET', '/stod/status', async (req) => {
 
 // Chatten (portad från Säkerkoll-communityn): vänner, grupper, E2E-meddelanden, bilder, stickers m.m. – se CHATT-API.md
 require('./chatt.js')({ rutt, q, db, fel, kravInloggad, begransad, now, sha, ipAv, crypto });
+
+// AdRaze Pro (Stripe-prenumeration) och Falk, AI-assistenten i webbläsaren – se pro.js
+const pro = require('./pro.js')({ rutt, q, db, fel, kravInloggad, begransad, now });
 
 http.createServer(async (req, res) => {
   const origin = req.headers.origin;
