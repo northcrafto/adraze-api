@@ -46,6 +46,8 @@ const q = (sql) => db.prepare(sql);
 if (!q("SELECT 1 FROM pragma_table_info('devices') WHERE name='install_id'").get()) db.exec('ALTER TABLE devices ADD COLUMN install_id TEXT');
 // Förnamnet som kontosidan hälsar med ("Välkommen, Cetto")
 if (!q("SELECT 1 FROM pragma_table_info('users') WHERE name='namn'").get()) db.exec('ALTER TABLE users ADD COLUMN namn TEXT');
+// Profilbild: färdigbeskuren JPEG (256×256) som data-URL, visas på kontosidan, i webbläsaren och i chatten
+if (!q("SELECT 1 FROM pragma_table_info('users') WHERE name='avatar'").get()) db.exec('ALTER TABLE users ADD COLUMN avatar TEXT');
 // Familj: barnkonton tillhör en förälder och loggar in i webbläsaren med sin barnkod + en kod som mejlas till föräldern
 db.exec(`CREATE TABLE IF NOT EXISTS barn(id TEXT PRIMARY KEY, foralder_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   namn TEXT NOT NULL, alder INTEGER NOT NULL, kod TEXT UNIQUE NOT NULL, blocklista TEXT NOT NULL DEFAULT '[]', tillat TEXT NOT NULL DEFAULT '[]',
@@ -298,9 +300,12 @@ const enhetsNamn = (req) => {
 
 const rutter = {};
 const rutt = (metod, p, fn) => { rutter[`${metod} ${p}`] = fn; };
+// Större kropp än standard (16 kB) för enstaka rutter, t.ex. bilder: rutt.max('/me/avatar', 200_000)
+const kroppMax = {};
+rutt.max = (p, n) => { kroppMax[p] = n; };
 // Bara bokstäver, mellanslag, bindestreck och apostrof; högst 40 tecken
 const rensaNamn = (n) => String(n || '').normalize('NFC').replace(/[^\p{L}\p{M} '’-]/gu, '').replace(/\s+/g, ' ').trim().slice(0, 40);
-const mig = (u) => ({ email: u.email, namn: u.namn || '', google: !!u.google_sub, losenord: !!u.pass, skapad: u.created_at });
+const mig = (u) => ({ email: u.email, namn: u.namn || '', avatar: u.avatar || null, google: !!u.google_sub, losenord: !!u.pass, skapad: u.created_at });
 
 rutt('GET', '/health', () => ({}));
 rutt('GET', '/auth/config', () => ({ googleClientId: GOOGLE_CLIENT_ID || null }));
@@ -443,6 +448,20 @@ rutt('POST', '/forslag', async (req, res, b) => {
     `Nytt citatförslag:\n\n"${citat}"\n– ${vem || 'okänd'}\n\nFrån ${u.email}`, u.email);
   if (!ok) throw fel(503, 'Förslaget kunde inte skickas just nu. Försök igen senare.');
   return {};
+});
+
+// Profilbild: klienten beskär och skalar själv till 256×256 JPEG; här kollas bara att det verkligen är en liten JPEG
+const AVATAR_MAX = 120_000;
+rutt.max('/me/avatar', AVATAR_MAX + 1_000);
+rutt('POST', '/me/avatar', async (req, res, b) => {
+  const u = kravInloggad(req);
+  if (begransad(`avatar:${u.id}`, 20, 3_600_000)) throw fel(429, 'För många byten. Vänta en stund.');
+  if (b.bild === null) { q('UPDATE users SET avatar=NULL WHERE id=?').run(u.id); return { avatar: null }; }
+  const m = typeof b.bild === 'string' && b.bild.length <= AVATAR_MAX && /^data:image\/jpeg;base64,([A-Za-z0-9+/]+=*)$/.exec(b.bild);
+  const bytes = m && Buffer.from(m[1], 'base64');
+  if (!bytes || bytes.length < 200 || bytes[0] !== 0xff || bytes[1] !== 0xd8 || bytes[2] !== 0xff) throw fel(400, 'Bilden kunde inte sparas. Försök med en annan bild.');
+  q('UPDATE users SET avatar=? WHERE id=?').run(b.bild, u.id);
+  return { avatar: b.bild };
 });
 
 rutt('POST', '/me/delete', async (req, res, b) => {
@@ -740,7 +759,7 @@ http.createServer(async (req, res) => {
   const fn = rutter[`${req.method} ${sokvag}`];
   if (!fn) return skicka(res, 404, { ok: false, error: 'Finns inte.' });
   try {
-    const b = req.method === 'POST' ? await json(req) : {};
+    const b = req.method === 'POST' ? await json(req, kroppMax[sokvag]) : {};
     skicka(res, 200, { ok: true, ...(await fn(req, res, b)) });
   } catch (e) {
     if (!e.expose) console.error(req.method, sokvag, e);
