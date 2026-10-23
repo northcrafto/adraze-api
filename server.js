@@ -731,6 +731,9 @@ rutt('GET', '/stod/status', async (req) => {
   return { status: s.status, belopp: (s.amount_total || 0) / 100 };
 });
 
+// Chatten (portad från Säkerkoll-communityn): vänner, grupper, E2E-meddelanden, bilder, stickers m.m. – se CHATT-API.md
+require('./chatt.js')({ rutt, q, db, fel, kravInloggad, begransad, now, sha, ipAv, crypto });
+
 http.createServer(async (req, res) => {
   const origin = req.headers.origin;
   if (origin && ORIGINS.has(origin)) {
@@ -763,6 +766,6 @@ http.createServer(async (req, res) => {
     skicka(res, 200, { ok: true, ...(await fn(req, res, b)) });
   } catch (e) {
     if (!e.expose) console.error(req.method, sokvag, e);
-    skicka(res, e.status || 500, { ok: false, error: e.expose ? e.message : 'Något gick fel. Försök igen.' });
+    skicka(res, e.status || 500, e.kropp || { ok: false, error: e.expose ? e.message : 'Något gick fel. Försök igen.' });   // e.kropp: rutten bestämmer själv felets form (chatten)
   }
 }).listen(PORT, '127.0.0.1', () => console.log(`adraze-api på 127.0.0.1:${PORT}`));
