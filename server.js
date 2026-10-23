@@ -46,6 +46,16 @@ const q = (sql) => db.prepare(sql);
 if (!q("SELECT 1 FROM pragma_table_info('devices') WHERE name='install_id'").get()) db.exec('ALTER TABLE devices ADD COLUMN install_id TEXT');
 // Förnamnet som kontosidan hälsar med ("Välkommen, Cetto")
 if (!q("SELECT 1 FROM pragma_table_info('users') WHERE name='namn'").get()) db.exec('ALTER TABLE users ADD COLUMN namn TEXT');
+// Familj: barnkonton tillhör en förälder och loggar in i webbläsaren med sin barnkod + en kod som mejlas till föräldern
+db.exec(`CREATE TABLE IF NOT EXISTS barn(id TEXT PRIMARY KEY, foralder_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  namn TEXT NOT NULL, alder INTEGER NOT NULL, kod TEXT UNIQUE NOT NULL, blocklista TEXT NOT NULL DEFAULT '[]', tillat TEXT NOT NULL DEFAULT '[]',
+  skapad INTEGER NOT NULL, senast INTEGER);
+CREATE TABLE IF NOT EXISTS barn_sessioner(token TEXT PRIMARY KEY, barn_id TEXT NOT NULL REFERENCES barn(id) ON DELETE CASCADE,
+  ip TEXT, skapad INTEGER NOT NULL, senast INTEGER, expires INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS barn_historik(barn_id TEXT NOT NULL REFERENCES barn(id) ON DELETE CASCADE, url TEXT NOT NULL, titel TEXT, ts INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS barn_historik_ts ON barn_historik(barn_id, ts);
+CREATE TABLE IF NOT EXISTS barn_godkann(barn_id TEXT PRIMARY KEY REFERENCES barn(id) ON DELETE CASCADE, hash TEXT NOT NULL,
+  tries INTEGER NOT NULL DEFAULT 0, expires INTEGER NOT NULL, sent_at INTEGER NOT NULL);`);
 
 // ---------- hjälpare ----------
 const now = () => Date.now();
@@ -176,19 +186,35 @@ function kakor(req) {
 }
 const kaka = (namn, varde, dagar) => `${namn}=${varde}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.round(dagar * 86400)}`;
 function laggTillKaka(res, k) { res.setHeader('Set-Cookie', [...[].concat(res.getHeader('Set-Cookie') || []), k]); }
-function nySession(res, userId) {
+// AdRaze-webbläsaren skickar app:true och får nycklarna i svaret i stället för som kakor
+const iAppen = (b) => !!b && b.app === true;
+const bearer = (req) => /^Bearer ([A-Za-z0-9_-]{20,100})$/.exec(String(req.headers.authorization || ''))?.[1] || null;
+function nySession(res, userId, app) {
   const t = crypto.randomBytes(32).toString('base64url');
   q('INSERT INTO sessions(token,user_id,expires) VALUES(?,?,?)').run(sha(t), userId, now() + SESSION_DAGAR * 86_400_000);
+  if (app) return t;
   laggTillKaka(res, kaka(COOKIE, t, SESSION_DAGAR));
+  return null;
 }
-function litaPa(res, userId) {
+function litaPa(res, userId, app) {
   const t = crypto.randomBytes(32).toString('base64url');
   q('INSERT INTO trusted(token,user_id,expires) VALUES(?,?,?)').run(sha(t), userId, now() + ENHET_DAGAR * 86_400_000);
+  if (app) return t;
   laggTillKaka(res, kaka(ENHET, t, ENHET_DAGAR));
+  return null;
 }
-const betrodd = (req, userId) => { const t = kakor(req)[ENHET]; return !!t && !!q('SELECT 1 FROM trusted WHERE token=? AND user_id=? AND expires>?').get(sha(t), userId, now()); };
+// Inloggad efter kod: session + betrodd webbläsare. I appen följer båda nycklarna med i svaret.
+function loggaIn(res, u, b) {
+  const app = iAppen(b);
+  const token = nySession(res, u.id, app), enhet = litaPa(res, u.id, app);
+  return app ? { me: mig(u), token, enhet } : { me: mig(u) };
+}
+const betrodd = (req, userId, b) => {
+  const t = kakor(req)[ENHET] || (iAppen(b) && typeof b.enhet === 'string' ? b.enhet : '');
+  return !!t && !!q('SELECT 1 FROM trusted WHERE token=? AND user_id=? AND expires>?').get(sha(t), userId, now());
+};
 function inloggad(req) {
-  const t = kakor(req)[COOKIE];
+  const t = kakor(req)[COOKIE] || bearer(req);
   return t ? q('SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires>?').get(sha(t), now()) || null : null;
 }
 function kravInloggad(req) { const u = inloggad(req); if (!u) throw fel(401, 'Du är inte inloggad.'); return u; }
@@ -288,6 +314,8 @@ rutt('POST', '/auth/signup', async (req, res, b) => {
   if (finns?.verified) throw fel(409, 'Det finns redan ett konto med den mejladressen. Logga in i stället.');
   if (finns) q('UPDATE users SET pass=? WHERE id=?').run(hashPass(b.password), finns.id);
   else q('INSERT INTO users(email,pass,verified,created_at) VALUES(?,?,0,?)').run(email, hashPass(b.password), now());
+  const namn = rensaNamn(b.namn);
+  if (namn) q('UPDATE users SET namn=? WHERE email=?').run(namn, email);
   kodSkickad(await skickaKod(email, 'verify'));
   return { steg: 'kod', syfte: 'verify', email };
 });
@@ -300,9 +328,7 @@ rutt('POST', '/auth/verify', async (req, res, b) => {
   const syfte = u.verified ? 'login' : 'verify';
   krav(anvandKod(email, syfte, b.code));
   if (!u.verified) q('UPDATE users SET verified=1 WHERE id=?').run(u.id);
-  nySession(res, u.id);
-  litaPa(res, u.id);
-  return { me: mig(q('SELECT * FROM users WHERE id=?').get(u.id)) };
+  return loggaIn(res, q('SELECT * FROM users WHERE id=?').get(u.id), b);
 });
 
 rutt('POST', '/auth/resend', async (req, res, b) => {
@@ -325,7 +351,7 @@ rutt('POST', '/auth/login', async (req, res, b) => {
   const pass = typeof b.password === 'string' ? b.password : '';
   if (!checkPass(pass, u?.pass) || !u) throw fel(401, 'Fel mejladress eller lösenord.');
   if (!u.verified) { kodSkickad(await skickaKod(email, 'verify')); return { steg: 'kod', syfte: 'verify', email }; }
-  if (betrodd(req, u.id)) { nySession(res, u.id); return { me: mig(u) }; }
+  if (betrodd(req, u.id, b)) { const token = nySession(res, u.id, iAppen(b)); return token ? { me: mig(u), token } : { me: mig(u) }; }
   const svar = await skickaKod(email, 'login');
   kodSkickad(svar);
   return { steg: 'kod', syfte: 'login', email };
@@ -340,9 +366,7 @@ rutt('POST', '/auth/google', async (req, res, b) => {
   else q('INSERT INTO users(email,google_sub,verified,created_at) VALUES(?,?,1,?)').run(g.email, g.sub, now());
   if (g.namn) q("UPDATE users SET namn=? WHERE google_sub=? AND COALESCE(namn,'')=''").run(g.namn, g.sub);
   u = q('SELECT * FROM users WHERE google_sub=?').get(g.sub);
-  nySession(res, u.id);
-  litaPa(res, u.id);
-  return { me: mig(u) };
+  return loggaIn(res, u, b);
 });
 
 rutt('POST', '/auth/forgot', async (req, res, b) => {
@@ -368,13 +392,11 @@ rutt('POST', '/auth/reset', async (req, res, b) => {
   // Nytt lösenord: logga ut överallt och glöm betrodda webbläsare
   q('DELETE FROM sessions WHERE user_id=?').run(u.id);
   q('DELETE FROM trusted WHERE user_id=?').run(u.id);
-  nySession(res, u.id);
-  litaPa(res, u.id);
-  return { me: mig(u) };
+  return loggaIn(res, u, b);
 });
 
 rutt('POST', '/auth/logout', (req, res) => {
-  const t = kakor(req)[COOKIE];
+  const t = kakor(req)[COOKIE] || bearer(req);
   if (t) q('DELETE FROM sessions WHERE token=?').run(sha(t));
   laggTillKaka(res, kaka(COOKIE, '', 0));
   return {};
@@ -468,6 +490,173 @@ rutt('POST', '/stats/sync', async (req, res, b) => {
     q('UPDATE devices SET install_id=? WHERE id=?').run(install, d.id);
   }
   q('UPDATE devices SET last_sync=? WHERE id=?').run(now(), d.id);
+  return {};
+});
+
+
+// ---------- Familj (AdRaze-webbläsaren) ----------
+// Föräldern skapar barnkonton. Barnet loggar in med sin barnkod, och för varje inloggning mejlas en
+// sexsiffrig kod till föräldern som barnet måste skriva in. Barnkoden ensam räcker alltså aldrig.
+const BARN_MAX = 10;
+const BARN_SESSIONER = 5;
+const BARN_DAGAR = 365;
+const KOD_TECKEN = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 32 tecken, inga som förväxlas (0/O, 1/I)
+function barnKod(namn) {
+  const bas = String(namn || '').normalize('NFD').replace(/[^A-Za-z]/g, '').toUpperCase().slice(0, 5) || 'BARN';
+  const bytes = crypto.randomBytes(8);
+  let r = '';
+  for (const x of bytes) r += KOD_TECKEN[x % 32];
+  return `${bas}-${r}`;
+}
+function nyBarnKod(namn) {
+  for (let i = 0; i < 10; i++) { const k = barnKod(namn); if (!q('SELECT 1 FROM barn WHERE kod=?').get(k)) return k; }
+  throw fel(500, 'Försök igen.');
+}
+const normBarnKod = (k) => String(k || '').toUpperCase().replace(/\s+/g, '').slice(0, 40);
+const lasLista = (x) => { try { const v = JSON.parse(x || '[]'); return Array.isArray(v) ? v : []; } catch { return []; } };
+const aktivaTillat = (x) => lasLista(x).filter((a) => a && a.host && a.until > now());
+const ettBarn = (u, id) => { const c = q('SELECT * FROM barn WHERE id=? AND foralder_id=?').get(String(id || ''), u.id); if (!c) throw fel(403, 'Det är inte ditt barn.'); return c; };
+function barnInloggad(req) {
+  const t = bearer(req);
+  const s = t && q('SELECT s.token, s.senast, b.* FROM barn_sessioner s JOIN barn b ON b.id=s.barn_id WHERE s.token=? AND s.expires>?').get(sha(t), now());
+  if (!s) throw fel(401, 'Du är inte inloggad.');
+  if (!s.senast || now() - s.senast > 300_000) {
+    q('UPDATE barn_sessioner SET senast=? WHERE token=?').run(now(), s.token);
+    q('UPDATE barn SET senast=? WHERE id=?').run(now(), s.id);
+  }
+  return s;
+}
+setInterval(() => {
+  q('DELETE FROM barn_sessioner WHERE expires<?').run(now());
+  q('DELETE FROM barn_godkann WHERE expires<?').run(now());
+}, 3_600_000).unref();
+
+const godkannMejl = (barn, kod, enhet) => ({
+  amne: `${kod} – ${barn.namn} vill logga in på AdRaze`,
+  html: mejlLayout(`${barn.namn} vill logga in`, mejlText(`<b style="color:#17171a">${esc(barn.namn)}</b> försöker logga in i AdRaze-webbläsaren (${esc(enhet)}). Ge koden till ${esc(barn.namn)} om det är hen som frågar.`) +
+    mejlKod(kod) + mejlText('Koden gäller i 15 minuter och fungerar bara en gång.') +
+    mejlRuta(`<b>Frågar ingen efter koden?</b> Då har någon annan fått tag i ${esc(barn.namn)}s barnkod. Skriv inte in den här koden någonstans, och tryck <i>Byt kod</i> på ${esc(barn.namn)} under Familj i AdRaze.`)),
+  text: `${barn.namn} vill logga in i AdRaze-webbläsaren (${enhet}).\n\nKod: ${kod}\n\nGe koden till ${barn.namn} om det är hen som frågar. Koden gäller i 15 minuter.\nFrågar ingen efter koden? Byt ${barn.namn}s kod under Familj i AdRaze.`,
+});
+
+// Barnet steg 1: barnkoden → en kod mejlas till föräldern
+rutt('POST', '/barn/start', async (req, res, b) => {
+  const kod = normBarnKod(b.kod);
+  if (kod.length < 4) throw fel(400, 'Skriv koden du fick av din förälder.');
+  if (begransad(`barnstart:${ipAv(req)}`, 15, 900_000) || begransad(`barnkod:${kod}`, 8, 900_000)) throw fel(429, 'För många försök. Vänta en stund.');
+  const barn = q('SELECT * FROM barn WHERE kod=?').get(kod);
+  if (!barn) throw fel(404, 'Fel kod. Fråga din förälder.');
+  const foralder = q('SELECT email FROM users WHERE id=?').get(barn.foralder_id);
+  const forra = q('SELECT sent_at FROM barn_godkann WHERE barn_id=?').get(barn.id);
+  if (forra && now() - forra.sent_at < 45_000) return { steg: 'godkann', namn: barn.namn, skickad: true };
+  const engang = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
+  q('INSERT OR REPLACE INTO barn_godkann(barn_id,hash,tries,expires,sent_at) VALUES(?,?,0,?,?)').run(barn.id, sha(`barn:${barn.id}:${engang}`), now() + KOD_TTL, now());
+  const m = godkannMejl(barn, engang, String(b.enhet || 'en dator').replace(/[^\p{L}\p{N} ._-]/gu, '').slice(0, 40) || 'en dator');
+  if (!(await skickaMejl(foralder.email, m.amne, m.html, m.text))) throw fel(502, 'Vi kunde inte skicka koden till din förälder just nu. Försök igen om en stund.');
+  return { steg: 'godkann', namn: barn.namn };
+});
+
+// Barnet steg 2: koden från föräldern → inloggad
+rutt('POST', '/barn/verifiera', async (req, res, b) => {
+  const kod = normBarnKod(b.kod);
+  if (begransad(`barnverif:${ipAv(req)}`, 30, 900_000)) throw fel(429, 'För många försök. Vänta en stund.');
+  const barn = q('SELECT * FROM barn WHERE kod=?').get(kod);
+  const g = barn && q('SELECT * FROM barn_godkann WHERE barn_id=?').get(barn.id);
+  if (!g || g.expires < now()) throw fel(410, 'Koden har gått ut. Be om en ny.');
+  if (g.tries >= 6) throw fel(429, 'För många fel försök. Be om en ny kod.');
+  if (typeof b.godkannande !== 'string' || !eq(sha(`barn:${barn.id}:${b.godkannande.replace(/\s/g, '')}`), g.hash)) {
+    q('UPDATE barn_godkann SET tries=tries+1 WHERE barn_id=?').run(barn.id);
+    throw fel(400, 'Fel kod. Fråga din förälder igen.');
+  }
+  q('DELETE FROM barn_godkann WHERE barn_id=?').run(barn.id);
+  const t = crypto.randomBytes(32).toString('base64url');
+  q('INSERT INTO barn_sessioner(token,barn_id,ip,skapad,senast,expires) VALUES(?,?,?,?,?,?)').run(sha(t), barn.id, ipAv(req), now(), now(), now() + BARN_DAGAR * 86_400_000);
+  q('DELETE FROM barn_sessioner WHERE barn_id=? AND token NOT IN (SELECT token FROM barn_sessioner WHERE barn_id=? ORDER BY skapad DESC LIMIT ?)').run(barn.id, barn.id, BARN_SESSIONER);
+  q('UPDATE barn SET senast=? WHERE id=?').run(now(), barn.id);
+  return { token: t, barn: { id: barn.id, namn: barn.namn, alder: barn.alder } };
+});
+
+rutt('POST', '/barn/jag', (req) => {
+  const c = barnInloggad(req);
+  return { namn: c.namn, alder: c.alder, blocklista: lasLista(c.blocklista), tillat: aktivaTillat(c.tillat) };
+});
+rutt('POST', '/barn/historik', (req, res, b) => {
+  const c = barnInloggad(req);
+  if (begransad(`barnhist:${c.id}`, 600, 3_600_000)) return {};
+  const url = String(b.url || '').slice(0, 500);
+  if (!/^https?:/i.test(url)) return {};
+  q('INSERT INTO barn_historik(barn_id,url,titel,ts) VALUES(?,?,?,?)').run(c.id, url, String(b.titel || '').slice(0, 200), now());
+  q('DELETE FROM barn_historik WHERE barn_id=? AND rowid NOT IN (SELECT rowid FROM barn_historik WHERE barn_id=? ORDER BY ts DESC LIMIT 500)').run(c.id, c.id);
+  return {};
+});
+rutt('POST', '/barn/logout', (req) => {
+  const t = bearer(req);
+  if (t) q('DELETE FROM barn_sessioner WHERE token=?').run(sha(t));
+  return {};
+});
+
+// Föräldern
+rutt('POST', '/familj/barn', (req, res, b) => {
+  const u = kravInloggad(req);
+  if (q('SELECT COUNT(*) AS n FROM barn WHERE foralder_id=?').get(u.id).n >= BARN_MAX) throw fel(429, `Högst ${BARN_MAX} barn per konto.`);
+  const namn = rensaNamn(b.namn), alder = parseInt(b.alder, 10);
+  if (!namn || !(alder >= 1 && alder <= 20)) throw fel(400, 'Fyll i namn och ålder (1–20).');
+  const id = 'b' + crypto.randomBytes(12).toString('hex'), kod = nyBarnKod(namn);
+  q('INSERT INTO barn(id,foralder_id,namn,alder,kod,skapad) VALUES(?,?,?,?,?,?)').run(id, u.id, namn, alder, kod, now());
+  return { barn: { id, namn, alder }, kod };
+});
+rutt('POST', '/familj/lista', (req) => {
+  const u = kravInloggad(req);
+  const antal = q('SELECT COUNT(*) AS n FROM barn_sessioner WHERE barn_id=? AND expires>?');
+  return { barn: q('SELECT * FROM barn WHERE foralder_id=? ORDER BY skapad').all(u.id).map((c) => ({
+    id: c.id, namn: c.namn, alder: c.alder, kod: c.kod, blocklista: lasLista(c.blocklista), tillat: aktivaTillat(c.tillat),
+    senast: c.senast || 0, inloggningar: antal.get(c.id, now()).n })) };
+});
+rutt('POST', '/familj/blocklista', (req, res, b) => {
+  const c = ettBarn(kravInloggad(req), b.barn_id);
+  const lista = Array.isArray(b.blocklista) ? b.blocklista.slice(0, 500).map((x) => String(x).slice(0, 120)) : [];
+  q('UPDATE barn SET blocklista=? WHERE id=?').run(JSON.stringify(lista), c.id);
+  return {};
+});
+rutt('POST', '/familj/tillat', (req, res, b) => {
+  const c = ettBarn(kravInloggad(req), b.barn_id);
+  const host = String(b.host || '').trim().toLowerCase().replace(/^www\./, '').slice(0, 200);
+  const min = parseInt(b.minuter, 10);
+  if (!host || !(min >= 1 && min <= 100_000)) throw fel(400, 'Ogiltig sida eller tid.');
+  const until = now() + min * 60_000;
+  const lista = aktivaTillat(c.tillat).filter((a) => a.host !== host).concat({ host, until });
+  q('UPDATE barn SET tillat=? WHERE id=?').run(JSON.stringify(lista), c.id);
+  return { until };
+});
+rutt('POST', '/familj/historik', (req, res, b) => {
+  const c = ettBarn(kravInloggad(req), b.barn_id);
+  return { historik: q('SELECT url, titel, ts FROM barn_historik WHERE barn_id=? ORDER BY ts DESC LIMIT 150').all(c.id) };
+});
+rutt('POST', '/familj/logga-ut', (req, res, b) => {
+  const c = ettBarn(kravInloggad(req), b.barn_id);
+  return { avslutade: Number(q('DELETE FROM barn_sessioner WHERE barn_id=?').run(c.id).changes) };
+});
+rutt('POST', '/familj/byt-kod', (req, res, b) => {
+  const c = ettBarn(kravInloggad(req), b.barn_id);
+  const kod = nyBarnKod(c.namn);
+  q('UPDATE barn SET kod=? WHERE id=?').run(kod, c.id);
+  q('DELETE FROM barn_godkann WHERE barn_id=?').run(c.id);
+  return { kod, avslutade: Number(q('DELETE FROM barn_sessioner WHERE barn_id=?').run(c.id).changes) };
+});
+rutt('POST', '/familj/inloggningar', (req, res, b) => {
+  const c = ettBarn(kravInloggad(req), b.barn_id);
+  return { namn: c.namn, inloggningar: q('SELECT token, ip, skapad, senast FROM barn_sessioner WHERE barn_id=? AND expires>? ORDER BY skapad DESC').all(c.id, now())
+    .map((s) => ({ sid: s.token.slice(0, 16), ip: s.ip || null, skapad: s.skapad, senast: s.senast || s.skapad })) };
+});
+rutt('POST', '/familj/logga-ut-inloggning', (req, res, b) => {
+  const c = ettBarn(kravInloggad(req), b.barn_id);
+  const sid = String(b.sid || '').replace(/[^a-f0-9]/g, '').slice(0, 64);
+  if (sid.length < 8) throw fel(400, 'Okänd inloggning.');
+  return { avslutade: Number(q('DELETE FROM barn_sessioner WHERE barn_id=? AND substr(token,1,?)=?').run(c.id, sid.length, sid).changes) };
+});
+rutt('POST', '/familj/ta-bort', (req, res, b) => {
+  const c = ettBarn(kravInloggad(req), b.barn_id);
+  q('DELETE FROM barn WHERE id=?').run(c.id);
   return {};
 });
 
