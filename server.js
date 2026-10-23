@@ -349,6 +349,7 @@ rutt('POST', '/auth/login', async (req, res, b) => {
   if (begransad(`login:${ipAv(req)}`, 20, 900_000) || begransad(`login:${email}`, 10, 900_000)) throw fel(429, 'För många försök. Vänta en stund.');
   const u = q('SELECT * FROM users WHERE email=?').get(email);
   const pass = typeof b.password === 'string' ? b.password : '';
+  if (u && !u.pass && u.google_sub) throw fel(401, 'Det här kontot är skapat med Google och har inget lösenord än. Välj "Glömt lösenord?" så skapar du ett.');
   if (!checkPass(pass, u?.pass) || !u) throw fel(401, 'Fel mejladress eller lösenord.');
   if (!u.verified) { kodSkickad(await skickaKod(email, 'verify')); return { steg: 'kod', syfte: 'verify', email }; }
   if (betrodd(req, u.id, b)) { const token = nySession(res, u.id, iAppen(b)); return token ? { me: mig(u), token } : { me: mig(u) }; }
