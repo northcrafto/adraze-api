@@ -1,0 +1,14 @@
+[Unit]
+Description=AdRaze Kolla (länkkoll + reklammätning med och utan AdRaze, nås via api.adraze.app/kolla)
+After=network-online.target
+
+[Service]
+WorkingDirectory=/home/doxed/adraze-api/kolla
+ExecStart=/usr/bin/node --no-warnings kolla.js
+Restart=always
+RestartSec=3
+MemoryMax=2500M
+Nice=5
+
+[Install]
+WantedBy=default.target

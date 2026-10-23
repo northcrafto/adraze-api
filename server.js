@@ -15,6 +15,7 @@ for (const rad of (fs.existsSync(path.join(DIR, '.env')) ? fs.readFileSync(path.
   if (m && !(m[1] in process.env)) process.env[m[1]] = m[2];
 }
 const PORT = Number(process.env.PORT || 8492);
+const KOLLA_PORT = Number(process.env.KOLLA_PORT || 8493);
 const SAJT = (process.env.SITE_URL || 'https://adraze.app').replace(/\/$/, '');
 const ORIGINS = new Set((process.env.ORIGINS || 'https://adraze.app').split(',').map((s) => s.trim()));
 const BREVO_KEY = process.env.BREVO_API_KEY || '';
@@ -536,6 +537,16 @@ http.createServer(async (req, res) => {
   // Inloggning med kakor tas bara emot från vår egen sajt (skydd mot CSRF)
   if (req.method === 'POST' && origin && !ORIGINS.has(origin) && !String(origin).startsWith('chrome-extension://')) return skicka(res, 403, { ok: false, error: 'Fel ursprung.' });
   const sokvag = new URL(req.url, 'http://x').pathname;
+  // Länkkollen är en egen tjänst (kolla/kolla.js, kör en webbläsare); hit kommer bara de anropen och skickas vidare
+  if (sokvag === '/kolla' || sokvag.startsWith('/kolla/')) {
+    const ut = http.request({ host: '127.0.0.1', port: KOLLA_PORT, method: req.method, path: req.url,
+      headers: { 'content-type': req.headers['content-type'] || '', 'content-length': req.headers['content-length'] || 0, 'cf-connecting-ip': ipAv(req) } }, (svar) => {
+      res.writeHead(svar.statusCode, svar.headers);
+      svar.pipe(res);
+    });
+    ut.on('error', () => skicka(res, 503, { ok: false, fel: 'nere' }));
+    return req.pipe(ut);
+  }
   const fn = rutter[`${req.method} ${sokvag}`];
   if (!fn) return skicka(res, 404, { ok: false, error: 'Finns inte.' });
   try {

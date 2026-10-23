@@ -1,0 +1,7 @@
+{
+  "name": "adraze-kolla",
+  "private": true,
+  "description": "AdRaze Kolla: länkkoll mot säkerhetslistor + mätning av reklam/spårare med och utan AdRaze",
+  "main": "kolla.js",
+  "dependencies": { "playwright-core": "1.61.1" }
+}
