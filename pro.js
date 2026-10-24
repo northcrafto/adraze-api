@@ -108,17 +108,42 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
     return { pro: r.aktiv, until: r.tills };
   });
 
+  // Status för inställningarna: hur länge Pro gäller och om prenumerationen är uppsagd
   rutt('GET', '/pro/status', async (req) => {
     const u = await uppdatera(kravInloggad(req));
-    return { pro: arPro(u), until: u.pro_until || null };
+    const svar = { pro: arPro(u), until: u.pro_until || null, prenumeration: null };
+    if (KEY && u.pro_sub) {
+      try {
+        const s = await stripe('GET', `subscriptions/${encodeURIComponent(u.pro_sub)}`);
+        if (s.customer === u.stripe_customer) {
+          const pris = s.items?.data?.[0]?.price;
+          svar.prenumeration = { status: s.status, slutar: !!s.cancel_at_period_end, periodSlut: s.current_period_end * 1000,
+            intervall: pris?.recurring?.interval || null, belopp: pris?.unit_amount ?? null, valuta: pris?.currency || null };
+        }
+      } catch {}
+    }
+    return svar;
   });
 
   // Säg upp: Pro gäller perioden ut och förnyas sedan inte
   rutt('POST', '/pro/cancel', async (req) => {
     const u = kravInloggad(req);
     if (!u.pro_sub) throw fel(400, 'Du har ingen prenumeration.');
+    const nu = await stripe('GET', `subscriptions/${encodeURIComponent(u.pro_sub)}`);
+    if (nu.customer !== u.stripe_customer) throw fel(400, 'Okänd prenumeration.');
+    if (nu.status !== 'active' && nu.status !== 'trialing') throw fel(400, 'Prenumerationen är redan avslutad.');
     const s = await stripe('POST', `subscriptions/${encodeURIComponent(u.pro_sub)}`, { cancel_at_period_end: 'true' });
-    if (s.customer !== u.stripe_customer) throw fel(400, 'Okänd prenumeration.');
+    return { until: s.current_period_end * 1000 };
+  });
+
+  // Ångra uppsägningen innan perioden gått ut
+  rutt('POST', '/pro/resume', async (req) => {
+    const u = kravInloggad(req);
+    if (!u.pro_sub) throw fel(400, 'Du har ingen prenumeration.');
+    const nu = await stripe('GET', `subscriptions/${encodeURIComponent(u.pro_sub)}`);
+    if (nu.customer !== u.stripe_customer) throw fel(400, 'Okänd prenumeration.');
+    if (nu.status !== 'active' && nu.status !== 'trialing') throw fel(400, 'Prenumerationen har redan tagit slut. Skaffa Pro igen i Falk.');
+    const s = await stripe('POST', `subscriptions/${encodeURIComponent(u.pro_sub)}`, { cancel_at_period_end: 'false' });
     return { until: s.current_period_end * 1000 };
   });
 
