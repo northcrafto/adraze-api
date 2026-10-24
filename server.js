@@ -17,7 +17,7 @@ for (const rad of (fs.existsSync(path.join(DIR, '.env')) ? fs.readFileSync(path.
 const PORT = Number(process.env.PORT || 8492);
 const KOLLA_PORT = Number(process.env.KOLLA_PORT || 8493);
 const SAJT = (process.env.SITE_URL || 'https://adraze.app').replace(/\/$/, '');
-const ORIGINS = new Set((process.env.ORIGINS || 'https://adraze.app,https://accounts.adraze.app').split(',').map((s) => s.trim()));
+const ORIGINS = new Set((process.env.ORIGINS || 'https://adraze.app,https://accounts.adraze.app,https://support.adraze.app').split(',').map((s) => s.trim()));
 const BREVO_KEY = process.env.BREVO_API_KEY || '';
 const MAIL_FROM = process.env.MAIL_FROM || 'konto@adraze.app';
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
@@ -736,6 +736,8 @@ require('./chatt.js')({ rutt, q, db, fel, kravInloggad, begransad, now, sha, ipA
 
 // AdRaze Pro (Stripe-prenumeration) och Falk, AI-assistenten i webbläsaren – se pro.js
 const pro = require('./pro.js')({ rutt, q, db, fel, kravInloggad, begransad, now });
+// Supportärenden (support.adraze.app) – se support.js
+require('./support.js')({ rutt, q, db, fel, inloggad, kravInloggad, begransad, now, sha, ipAv, crypto, skickaMejl, mejlLayout, mejlText, esc, normEmail, EMAIL_RE });
 require('./synk.js')({ rutt, q, db, fel, kravInloggad, begransad, now });
 
 http.createServer(async (req, res) => {
