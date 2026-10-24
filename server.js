@@ -17,7 +17,7 @@ for (const rad of (fs.existsSync(path.join(DIR, '.env')) ? fs.readFileSync(path.
 const PORT = Number(process.env.PORT || 8492);
 const KOLLA_PORT = Number(process.env.KOLLA_PORT || 8493);
 const SAJT = (process.env.SITE_URL || 'https://adraze.app').replace(/\/$/, '');
-const ORIGINS = new Set((process.env.ORIGINS || 'https://adraze.app').split(',').map((s) => s.trim()));
+const ORIGINS = new Set((process.env.ORIGINS || 'https://adraze.app,https://accounts.adraze.app').split(',').map((s) => s.trim()));
 const BREVO_KEY = process.env.BREVO_API_KEY || '';
 const MAIL_FROM = process.env.MAIL_FROM || 'konto@adraze.app';
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
