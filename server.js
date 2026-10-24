@@ -736,6 +736,7 @@ require('./chatt.js')({ rutt, q, db, fel, kravInloggad, begransad, now, sha, ipA
 
 // AdRaze Pro (Stripe-prenumeration) och Falk, AI-assistenten i webbläsaren – se pro.js
 const pro = require('./pro.js')({ rutt, q, db, fel, kravInloggad, begransad, now });
+require('./synk.js')({ rutt, q, db, fel, kravInloggad, begransad, now });
 
 http.createServer(async (req, res) => {
   const origin = req.headers.origin;
