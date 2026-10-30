@@ -148,7 +148,7 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
   });
 
   // Falk: AI-assistenten, bara för Pro
-  rutt.max('/falk/chat', 400_000);
+  rutt.max('/falk/chat', 1_400_000);   // bifogade filer/mappar och projektfiler (klienten håller sig under ~60k + 100k tecken)
   rutt('POST', '/falk/chat', async (req, res, b) => {
     const u = await uppdatera(kravInloggad(req));
     if (!arPro(u)) throw Object.assign(fel(402, 'Falk ingår i AdRaze Pro.'), { kropp: { ok: false, error: 'no_pro', message: 'Falk ingår i AdRaze Pro.' } });
@@ -156,12 +156,15 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
     if (begransad(`falk:${u.id}`, AI_PER_DYGN, 86_400_000)) throw fel(429, 'Du har ställt väldigt många frågor i dag. Försök igen i morgon.');
     const msgs = (Array.isArray(b.messages) ? b.messages : []).slice(-16)
       .filter((m) => m && ['user', 'assistant', 'system'].includes(m.role) && typeof m.content === 'string')
-      .map((m) => ({ role: m.role, content: m.content.slice(0, 12000) }));
+      .map((m) => ({ role: m.role, content: m.content.slice(0, 120_000) }));
     if (!msgs.length) throw fel(400, 'Skriv en fråga.');
+    // Totalt tak: blir det för mycket kortas de äldsta meddelandena först (instruktionerna först i listan och din senaste fråga behålls)
+    let tot = msgs.reduce((a, m) => a + m.content.length, 0);
+    for (let i = 2; tot > 280_000 && i < msgs.length - 1; i++) { tot -= msgs[i].content.length; msgs[i].content = msgs[i].content.slice(0, 2000) + '\n…(äldre meddelande kortat)'; tot += msgs[i].content.length; }
     const r = await fetch(AI_BASE, {
       method: 'POST', signal: AbortSignal.timeout(60_000),
       headers: { authorization: `Bearer ${AI_KEY}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ model: AI_MODEL, messages: msgs, max_tokens: 1800, temperature: 0.4, reasoning_effort: 'none' }),
+      body: JSON.stringify({ model: AI_MODEL, messages: msgs, max_tokens: 4000, temperature: 0.4, reasoning_effort: 'none' }),
     }).catch(() => null);
     const d = r ? await r.json().catch(() => ({})) : {};
     const svar = d.choices?.[0]?.message?.content;
