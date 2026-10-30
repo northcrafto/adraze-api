@@ -283,9 +283,18 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad, begr
     bas(req, res);
     const u = kravInloggad(req);
     const p = q('SELECT * FROM chatt_profiler WHERE user_id=?').get(u.id);
-    if (!p) return { profil: null };
+    if (!p) {
+      // Förslag på användarnamn ur kontots namn (eller mejlen), ledigt just nu
+      const a = q('SELECT namn, email FROM users WHERE id=?').get(u.id) || {};
+      let bas0 = String(a.namn || String(a.email || '').split('@')[0] || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Za-z0-9_]/g, '').slice(0, 16);
+      if (bas0.length < 3) bas0 = (bas0 + 'user').slice(0, 16);
+      let forslag = bas0;
+      for (let i = 0; i < 30 && q('SELECT 1 FROM chatt_profiler WHERE username_lower=?').get(forslag.toLowerCase()); i++) forslag = bas0 + (Math.floor(Math.random() * 9000) + 100);
+      return { profil: null, forslag };
+    }
     if (p.suspended_until && p.suspended_until > now()) { const s = suspendedBody(p.suspended_until); throw E(res, 403, 'suspended', s.message, { suspended_until: s.suspended_until }); }
-    return { profil: true, ...migSjalv(p) };
+    let auto = false; try { const sec = lasHemlighet(u.id); auto = !!sec && timingSafeStrEqual(p.login_hash, autoHash(sec)); } catch {}
+    return { profil: true, ...migSjalv(p), auto };
   });
 
   rutt('POST', '/chatt/registrera', async (req, res, b) => {
@@ -334,6 +343,59 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad, begr
     }
     clearLoginFails(ip, 'li:' + p.user_id);
     return { id: idUt(p.user_id), username: p.username, public_key: p.public_key, enc_priv: p.enc_priv, account: null, avatar: avatarAv(p.user_id) };
+  });
+
+  // ======================================================================
+  // Kontonyckel: chatten låses upp av AdRaze-inloggningen, ingen kod att spara.
+  // Varje konto får en slumpad hemlighet (32 byte). Klienten härleder ur den nyckeln som krypterar den
+  // privata ECDH-nyckeln (enc_priv) och login_hash = sha256("adraze-chatt-auto-v1:" + hemlighet).
+  // Hemligheten sparas krypterad (AES-256-GCM) med CHATT_NYCKEL från .env – den finns aldrig i databasen,
+  // så en databasläcka räcker inte för att läsa någons meddelanden.
+  // ======================================================================
+  db.exec(`CREATE TABLE IF NOT EXISTS chatt_nycklar(
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    secret_enc TEXT NOT NULL, created_at INTEGER NOT NULL);`);
+  const MASTER = /^[0-9a-f]{64}$/i.test(process.env.CHATT_NYCKEL || '') ? Buffer.from(process.env.CHATT_NYCKEL, 'hex') : null;
+  if (!MASTER) console.error('chatt: CHATT_NYCKEL saknas i .env – automatisk upplåsning av chatten är avstängd');
+  function lasHemlighet(uid) {
+    const r = q('SELECT secret_enc FROM chatt_nycklar WHERE user_id=?').get(uid);
+    if (!r || !MASTER) return null;
+    const b = Buffer.from(r.secret_enc, 'base64');
+    const d = nodeCrypto.createDecipheriv('aes-256-gcm', MASTER, b.subarray(0, 12));
+    d.setAuthTag(b.subarray(12, 28)); d.setAAD(Buffer.from('chatt:' + uid));
+    return Buffer.concat([d.update(b.subarray(28)), d.final()]).toString('base64');
+  }
+  function kontoHemlighet(uid) {
+    const har = lasHemlighet(uid); if (har) return har;
+    if (!MASTER) return null;
+    const sec = nodeCrypto.randomBytes(32), iv = nodeCrypto.randomBytes(12);
+    const c = nodeCrypto.createCipheriv('aes-256-gcm', MASTER, iv); c.setAAD(Buffer.from('chatt:' + uid));
+    const ct = Buffer.concat([c.update(sec), c.final()]);
+    q('INSERT OR IGNORE INTO chatt_nycklar(user_id, secret_enc, created_at) VALUES(?,?,?)').run(uid, Buffer.concat([iv, c.getAuthTag(), ct]).toString('base64'), now());
+    return lasHemlighet(uid);   // läs tillbaka (två samtidiga anrop får samma hemlighet)
+  }
+  const autoHash = (secB64) => nodeCrypto.createHash('sha256').update('adraze-chatt-auto-v1:' + secB64).digest('base64');
+
+  rutt('GET', '/chatt/nyckel', (req, res) => {
+    bas(req, res);
+    grans(req, res, 'nyckel', 60, KVART, 'För många försök. Vänta en stund och försök igen.');
+    const u = kravInloggad(req);
+    const secret = kontoHemlighet(u.id);
+    if (!secret) throw E(res, 503, 'unavailable', 'Chatten kan inte låsas upp just nu. Försök igen senare.');
+    res.setHeader('Cache-Control', 'no-store');
+    return { secret };
+  });
+
+  // Byt till kontonyckeln (profiler från tiden med hemlig kod). Nya nycklar ⇒ gamla meddelanden går inte att läsa.
+  rutt('POST', '/chatt/users/ny-nyckel', (req, res, b) => {
+    grans(req, res, 'nynyckel', 10, 3600_000, 'För många försök. Vänta en stund och försök igen.');
+    const p = profil(req, res);
+    const secret = kontoHemlighet(p.user_id);
+    if (!secret) throw E(res, 503, 'unavailable', 'Chatten kan inte låsas upp just nu. Försök igen senare.');
+    if (!isSaneB64(b.public_key, PUBKEY_MAX) || !isSaneB64(b.enc_priv, ENCPRIV_MAX) || !isSaneB64(b.login_hash, HASH_MAX)) throw E(res, 400, 'invalid_input');
+    if (!timingSafeStrEqual(autoHash(secret), b.login_hash)) throw E(res, 403, 'wrong_code', 'Fel nyckel.');
+    q('UPDATE chatt_profiler SET public_key=?, enc_priv=?, login_hash=?, rec_salt=NULL, rec_auth=NULL, rec_blob=NULL WHERE user_id=?').run(b.public_key, b.enc_priv, b.login_hash, p.user_id);
+    return { public_key: b.public_key };
   });
 
   rutt('GET', '/chatt/users/me', (req, res) => {

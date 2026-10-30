@@ -19,12 +19,23 @@ Säkerkoll-communityns chatt-backend, portad till AdRaze-kontona (`chatt.js`). B
 
 | Metod | Rutt | In | Ut |
 |---|---|---|---|
-| GET | `/chatt/jag` | – | Ingen profil: `{profil:null}`. Annars `{profil:true, id, username, bubble, has_account:false, account_last4:null, has_recovery, avatar, public_key}` |
+| GET | `/chatt/jag` | – | Ingen profil: `{profil:null, forslag}` (ledigt användarnamn från `users.namn` eller mejlens början). Annars `{profil:true, id, username, bubble, has_account:false, account_last4:null, has_recovery, avatar, public_key, auto}` (`auto` = profilen är låst med kontonyckeln) |
 | POST | `/chatt/registrera` | `{username, login_hash, public_key, enc_priv}` + valfritt räddning direkt: `{salt, rec_auth, rec_blob}` (alla tre eller inget) | `{id, username, has_recovery}`. Fel: `400 invalid_username` (3–20 tecken `A-Za-z0-9_`), `400 invalid_login_hash/invalid_public_key/invalid_enc_priv/invalid_input`, `409 username_taken` (versalokänsligt), `409 already_registered`, `429 too_many_users_per_ip` |
 | POST | `/chatt/users/login` | `{login_hash, username?}` | Lås upp nycklarna på ny enhet (motsvarar Säkerkolls `/users/login`, men bara för den egna profilen): `{id, username, public_key, enc_priv, account:null, avatar}`. Fel: `401 invalid_login {attempts_left}`, `429 login_locked {retry_after_seconds}` (5 fel → 5 min) |
 | GET | `/chatt/users/me` | – | `{id, username, bubble, has_account:false, account_last4:null, has_recovery, avatar}` |
 
 Gränser: `login_hash` ≤200, `public_key` ≤2000, `enc_priv` ≤4000 base64-tecken (`[A-Za-z0-9+/=_-]`).
+
+## Kontonyckel (chatten följer AdRaze-kontot)
+
+Ingen hemlig kod längre: servern håller en slumpad hemlighet per konto (32 byte i `chatt_nycklar`, krypterad med AES-256-GCM under `CHATT_NYCKEL` i `.env`, 64 hex; utan den svarar rutterna `503`). Klienten härleder `login_hash = b64(sha256("adraze-chatt-auto-v1:" + secret))` och omslagsnyckeln `sha256("adraze-chatt-wrap-v1:" + secret)` (AES-GCM) för `enc_priv`. Samma konto på en annan dator = samma nycklar, direkt in med alla kontakter.
+
+| Metod | Rutt | In | Ut |
+|---|---|---|---|
+| GET | `/chatt/nyckel` | – | `{secret}` (base64, `Cache-Control: no-store`), skapas första gången. 60/15 min |
+| POST | `/chatt/users/ny-nyckel` | `{public_key, enc_priv, login_hash}` | `{}` – byter en gammal kodprofils nycklar mot kontonyckeln (`login_hash` måste vara kontots); räddningen nollas. 10/h |
+
+**Backup av `CHATT_NYCKEL`:** tappas den kan ingen låsa upp sina chattnycklar. Kopia på mint i `~/.config/adraze-api/chatt-nyckel.env`.
 
 ## Inställningar, kod, räddning
 

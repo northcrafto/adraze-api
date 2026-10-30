@@ -21,10 +21,10 @@ if (!src.includes("require('./chatt.js')")) {
   src = src.slice(0, i) + "require('./chatt.js')({ rutt, q, db, fel, kravInloggad, begransad, now, sha, ipAv, crypto });\n" + src.slice(i);
 }
 fs.writeFileSync(path.join(tmp, 'server.js'), src);
-fs.copyFileSync(path.join(REPO, 'chatt.js'), path.join(tmp, 'chatt.js'));
+for (const f of fs.readdirSync(REPO)) if (f.endsWith('.js') && f !== 'server.js') fs.copyFileSync(path.join(REPO, f), path.join(tmp, f));
 
 const srv = spawn(process.execPath, [path.join(tmp, 'server.js')], {
-  cwd: tmp, env: { ...process.env, PORT: String(PORT), MAIL_LOGG: '1', CHATT_HOTLISTOR: '0', BREVO_API_KEY: '', CLAMD_PORT: '1' }, stdio: ['ignore', 'pipe', 'pipe'],
+  cwd: tmp, env: { ...process.env, PORT: String(PORT), MAIL_LOGG: '1', CHATT_HOTLISTOR: '0', BREVO_API_KEY: '', CLAMD_PORT: '1', CHATT_NYCKEL: crypto.randomBytes(32).toString('hex') }, stdio: ['ignore', 'pipe', 'pipe'],
 });
 let logg = '';
 srv.stdout.on('data', (d) => { logg += d; });
