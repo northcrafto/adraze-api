@@ -1,0 +1,17 @@
+[Unit]
+Description=AdRaze Proxy (webbproxy med AdRazes adblocker inbyggd, nås via proxy.adraze.app)
+After=network-online.target
+
+[Service]
+WorkingDirectory=/home/doxed/adraze-api/proxy
+ExecStart=/usr/bin/node --no-warnings proxy.mjs
+Restart=always
+RestartSec=3
+MemoryMax=1200M
+TasksMax=256
+NoNewPrivileges=true
+Nice=5
+Environment=PROXY_PORT=8495
+
+[Install]
+WantedBy=default.target

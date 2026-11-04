@@ -1,0 +1,13 @@
+{
+  "name": "adraze-proxy",
+  "private": true,
+  "type": "module",
+  "description": "AdRaze Proxy: webbproxy (Scramjet + Wisp) med AdRazes adblocker inbyggd, nås via proxy.adraze.app",
+  "main": "proxy.mjs",
+  "dependencies": {
+    "@mercuryworkshop/bare-mux": "2.1.9",
+    "@mercuryworkshop/libcurl-transport": "1.5.2",
+    "@mercuryworkshop/scramjet": "1.1.0",
+    "@mercuryworkshop/wisp-js": "0.5.2"
+  }
+}
