@@ -9,5 +9,6 @@
     "@mercuryworkshop/libcurl-transport": "1.5.2",
     "@mercuryworkshop/scramjet": "1.1.0",
     "@mercuryworkshop/wisp-js": "0.5.2"
-  }
+  },
+  "license": "AGPL-3.0-only"
 }
