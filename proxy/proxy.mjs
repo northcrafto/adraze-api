@@ -260,7 +260,7 @@ const server = http.createServer((req, res) => {
   }
   const html = fil.endsWith('.html');
   skickaFil(req, res, fil, html ? {
-    'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' wss://proxy.adraze.app ws://127.0.0.1:* ws://localhost:*; frame-src 'self'; worker-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'",
+    'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-src 'self'; worker-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'",
     'X-Frame-Options': 'DENY',
   } : {});
 });
@@ -271,7 +271,9 @@ server.on('upgrade', (req, socket, head) => {
   const p = (req.url || '').split('?')[0];
   if (p !== '/wisp/') { socket.destroy(); return; }
   const ursprung = String(req.headers.origin || '');
-  if (ursprung && !/^https:\/\/proxy\.adraze\.app$|^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(ursprung)) { socket.destroy(); return; }
+  // Bara sidor från samma värd får öppna Wisp (annars kunde vilken sajt som helst använda proxyn som sin egen)
+  const vard = String(req.headers.host || '');
+  if (ursprung && ursprung !== `https://${vard}` && ursprung !== `http://${vard}`) { socket.destroy(); return; }
   const ip = ipAv(req);
   const n = aktiva.perIp.get(ip) || 0;
   if (n >= MAX_WS_PER_IP || aktiva.totalt >= MAX_WS_TOTALT) {
