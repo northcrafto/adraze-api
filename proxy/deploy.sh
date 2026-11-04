@@ -10,6 +10,8 @@ rsync -a --delete --exclude node_modules --exclude webb --exclude extension ./ "
 # Sidans js/css får ?v=<innehållshash> så att Cloudflare och webbläsare aldrig ger en gammal version
 WEBB=$(mktemp -d); trap 'rm -rf "$WEBB"' EXIT
 rsync -a --delete ~/adraze/proxy/ "$WEBB/"
+# Samma bakgrundsfoton som AdRaze-webbläsaren (servern godtar bara de här i /adraze/bild/)
+cp ~/adraze/browser/ui/bakgrunder.json "$WEBB/bakgrunder.json"
 for f in proxy.js proxy.css main.js style.css; do
   [ -f "$WEBB/$f" ] || continue
   v=$(sha256sum "$WEBB/$f" | cut -c1-10)

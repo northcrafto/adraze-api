@@ -15,6 +15,7 @@ import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+import os from 'node:os';
 import { server as wisp, logging } from '@mercuryworkshop/wisp-js/server';
 
 const require = createRequire(import.meta.url);
@@ -211,6 +212,58 @@ function skickaKomprimerat(req, res, typ, data, huvud) {
   res.end(data.gz ? zlib.gunzipSync(data.gz) : data.raw);
 }
 
+
+// ---------- bilder till ny flik-sidan ----------
+// Bakgrundsfoton (Pexels) och genvägsikoner (DuckDuckGo) hämtas av servern, så att besökarens IP aldrig når dem.
+// Bara foton i vår egen lista och vanliga värdnamn, högst 6 MB/400 kB, sparas på disk utanför koden.
+const EXTCACHE = path.join(os.homedir(), '.cache', 'adraze-proxy');
+fs.mkdirSync(path.join(EXTCACHE, 'bild'), { recursive: true });
+fs.mkdirSync(path.join(EXTCACHE, 'ikon'), { recursive: true });
+let bildIds = new Set(), bildLista = [];
+function lasBildlista() {
+  try { bildLista = JSON.parse(fs.readFileSync(path.join(WEBB, 'bakgrunder.json'), 'utf8')); } catch { bildLista = []; }
+  bildIds = new Set(bildLista.map((b) => String(b[0]) + '/' + b[1]));
+}
+const bildPost = (b) => ({ id: b[0], fil: b[1], namn: b[2], farg: b[3] });
+// /adraze/bakgrund -> ett slumpat foto, ?dag=2026-11-04 -> dagens (samma för alla den dagen), ?galleri -> ett urval
+function bakgrund(u) {
+  if (!bildLista.length) return null;
+  if (u.searchParams.has('galleri')) return bildLista.filter((_, i) => i % Math.max(1, Math.floor(bildLista.length / 24)) === 0).slice(0, 24).map(bildPost);
+  const dag = u.searchParams.get('dag');
+  if (dag && /^\d{4}-\d{2}-\d{2}$/.test(dag)) return bildPost(bildLista[crypto.createHash('sha1').update(dag).digest().readUInt32BE(0) % bildLista.length]);
+  return bildPost(bildLista[crypto.randomInt(bildLista.length)]);
+}
+lasBildlista();
+setInterval(lasBildlista, 3_600_000).unref();
+const BREDDER = new Set(['320', '640', '1280', '1600', '1920', '2560', '3840']);
+const pagaende = new Map();
+async function hamtaTillCache(fil, kalla, max, typer) {
+  if (pagaende.has(fil)) return pagaende.get(fil);
+  const jobb = (async () => {
+    const r = await fetch(kalla, { redirect: 'follow', signal: AbortSignal.timeout(15000), headers: { 'User-Agent': 'AdRaze-Proxy/1.0 (+https://proxy.adraze.app)' } });
+    const typ = (r.headers.get('content-type') || '').split(';')[0].trim();
+    if (!r.ok || !typer.test(typ)) throw new Error('svar ' + r.status + ' ' + typ);
+    const data = Buffer.from(await r.arrayBuffer());
+    if (data.length > max) throw new Error('för stor');
+    fs.writeFileSync(fil + '.tmp', data); fs.renameSync(fil + '.tmp', fil);
+    fs.writeFileSync(fil + '.typ', typ);
+  })().finally(() => pagaende.delete(fil));
+  pagaende.set(fil, jobb);
+  return jobb;
+}
+async function skickaExtern(req, res, fil, kalla, max, typer, livstid) {
+  const st = fs.statSync(fil, { throwIfNoEntry: false });
+  if (!st || Date.now() - st.mtimeMs > livstid * 1000) {
+    try { await hamtaTillCache(fil, kalla, max, typer); } catch { if (!st) return skickaFel(req, res, 404); }   // gammal kopia duger
+  }
+  try {
+    const typ = fs.readFileSync(fil + '.typ', 'utf8');
+    const data = fs.readFileSync(fil);
+    res.writeHead(200, { 'Content-Type': typ, 'Content-Length': data.length, 'Cache-Control': `public, max-age=${livstid}`, ...SAKERHET });
+    res.end(req.method === 'HEAD' ? undefined : data);
+  } catch { skickaFel(req, res, 404); }
+}
+
 const server = http.createServer((req, res) => {
   let u;
   try { u = new URL(req.url, 'http://x'); } catch { return skickaFel(req, res, 400); }
@@ -238,6 +291,20 @@ const server = http.createServer((req, res) => {
     const fil = inom(path.join(TILLAGG, 'stubbar'), p.slice('/adraze/stubbar/'.length));
     return fil ? skickaFil(req, res, fil, { 'Cache-Control': 'public, max-age=86400' }) : skickaFel(req, res, 404);
   }
+  if (p === '/adraze/bakgrund') {
+    const b = bakgrund(u);
+    if (!b) return skickaFel(req, res, 404);
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': u.searchParams.has('dag') || u.searchParams.has('galleri') ? 'public, max-age=3600' : 'no-store', ...SAKERHET });
+    return res.end(JSON.stringify(b));
+  }
+  const bm = /^\/adraze\/bild\/(\d{1,12})\/(pexels-photo-\d{1,12}\.(?:jpe?g|png))$/.exec(p);
+  if (bm) {
+    const w = String(u.searchParams.get('w') || '1920');
+    if (!bildIds.has(bm[1] + '/' + bm[2]) || !BREDDER.has(w)) return skickaFel(req, res, 404);
+    return skickaExtern(req, res, path.join(EXTCACHE, 'bild', `${bm[1]}-${w}`), `https://images.pexels.com/photos/${bm[1]}/${bm[2]}?auto=compress&cs=tinysrgb&w=${w}`, 6 << 20, /^image\/(jpeg|png|webp)$/, 30 * 86400);
+  }
+  const im = /^\/adraze\/ikon\/([a-z0-9-]{1,63}(?:\.[a-z0-9-]{1,63}){1,6})$/.exec(p.toLowerCase());
+  if (im) return skickaExtern(req, res, path.join(EXTCACHE, 'ikon', im[1]), `https://icons.duckduckgo.com/ip3/${im[1]}.ico`, 400 << 10, /^image\//, 7 * 86400);
   if (p === '/adraze/status') {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...SAKERHET });
     return res.end(JSON.stringify({ ok: true, regler: regler.version, anslutna: aktiva.totalt, stoppade: statistik.stoppade, sedan: statistik.start }));
