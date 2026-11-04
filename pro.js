@@ -163,7 +163,8 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
     // Totalt tak: blir det för mycket kortas de äldsta meddelandena först (instruktionerna först i listan och din senaste fråga behålls)
     let tot = msgs.reduce((a, m) => a + m.content.length, 0);
     for (let i = 2; tot > 280_000 && i < msgs.length - 1; i++) { tot -= msgs[i].content.length; msgs[i].content = msgs[i].content.slice(0, 2000) + '\n…(äldre meddelande kortat)'; tot += msgs[i].content.length; }
-    msgs.splice(msgs[0].role === 'system' ? 1 : 0, 0, { role: 'system', content: webbInstruktion() });
+    msgs.splice(msgs[0].role === 'system' ? 1 : 0, 0, { role: 'system', content: webbInstruktion() + (b.flik ? FLIK_INSTRUKTION : '') });
+    const verktyg = b.flik ? WEBB_VERKTYG.concat(FLIK_VERKTYG) : WEBB_VERKTYG;
     // Falk får söka och läsa sidor själv; klienten väntar 70 s, så allt måste vara klart långt innan
     const slut = Date.now() + 55_000, kallor = [], traffar = [];
     let sokningar = 0, lasta = 0, svar = null;
@@ -172,7 +173,7 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
       const r = await fetch(AI_BASE, {
         method: 'POST', signal: AbortSignal.timeout(Math.max(5_000, Math.min(45_000, slut - Date.now()))),
         headers: { authorization: `Bearer ${AI_KEY}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ model: AI_MODEL, messages: msgs, max_tokens: 4000, temperature: 0.4, reasoning_effort: 'none', tools: WEBB_VERKTYG, tool_choice: sista ? 'none' : 'auto' }),
+        body: JSON.stringify({ model: AI_MODEL, messages: msgs, max_tokens: 4000, temperature: 0.4, reasoning_effort: 'none', tools: verktyg, tool_choice: sista ? 'none' : 'auto' }),
       }).catch(() => null);
       const d = r ? await r.json().catch(() => ({})) : {};
       const m = d.choices?.[0]?.message;
@@ -186,6 +187,12 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
         break;
       }
       m.content = dsml.text;
+      // Handlingar på användarens flik körs i webbläsaren: skicka tillbaka dem, panelen kör dem och frågar igen
+      const flikAnrop = b.flik ? anrop.filter((a) => FLIK_NAMN.has(a.function?.name)) : [];
+      if (flikAnrop.length) {
+        const actions = flikAnrop.slice(0, 3).map((a) => { let arg = {}; try { arg = JSON.parse(a.function.arguments || '{}'); } catch {} return flikHandling(a.function.name, arg); }).filter(Boolean);
+        return { reply: (m.content || '').trim(), actions, sources: [] };
+      }
       msgs.push({ role: 'assistant', content: m.content || '', tool_calls: anrop });
       const utfall = await Promise.all(anrop.map(async (a) => {
         let arg = {}; try { arg = JSON.parse(a.function?.arguments || '{}'); } catch {}
@@ -235,6 +242,30 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
     { type: 'function', function: { name: 'web_search', description: 'Sök på webben (Google). Ger titel, URL och ett kort utdrag per träff.', parameters: { type: 'object', properties: { query: { type: 'string', description: 'Sökfrågan, gärna med årtal för aktuella saker' } }, required: ['query'] } } },
     { type: 'function', function: { name: 'read_page', description: 'Hämta en webbsida och läs dess text. Använd för att få faktiska siffror, priser och detaljer som utdragen saknar.', parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } } },
   ];
+  const FLIK_VERKTYG = [
+    { type: 'function', function: { name: 'klicka', description: 'Klicka på ett element på användarens öppna flik.', parameters: { type: 'object', properties: { nummer: { type: 'integer', description: 'Elementets nummer i listan ELEMENT' } }, required: ['nummer'] } } },
+    { type: 'function', function: { name: 'skriv', description: 'Skriv text i ett fält (eller välj ett alternativ i en lista) på användarens flik. Ersätter det som står i fältet.', parameters: { type: 'object', properties: { nummer: { type: 'integer' }, text: { type: 'string' } }, required: ['nummer', 'text'] } } },
+    { type: 'function', function: { name: 'tangent', description: 'Tryck en tangent på fliken: enter, tab eller escape.', parameters: { type: 'object', properties: { tangent: { type: 'string', enum: ['enter', 'tab', 'escape'] } }, required: ['tangent'] } } },
+    { type: 'function', function: { name: 'ga_till', description: 'Öppna en adress i användarens flik.', parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } } },
+    { type: 'function', function: { name: 'scrolla', description: 'Scrolla fliken en skärmhöjd upp eller ned.', parameters: { type: 'object', properties: { riktning: { type: 'string', enum: ['ned', 'upp'] } }, required: ['riktning'] } } },
+    { type: 'function', function: { name: 'tillbaka', description: 'Gå tillbaka till förra sidan i fliken.', parameters: { type: 'object', properties: {} } } },
+  ];
+  const FLIK_NAMN = new Set(FLIK_VERKTYG.map((v) => v.function.name));
+  function flikHandling(namn, arg) {
+    if (namn === 'klicka') return { name: 'klicka', value: String(parseInt(arg.nummer, 10) || '') };
+    if (namn === 'skriv') return { name: 'skriv', value: (parseInt(arg.nummer, 10) || '') + '|' + String(arg.text || '').slice(0, 500) };
+    if (namn === 'tangent') return { name: 'tangent', value: String(arg.tangent || 'enter') };
+    if (namn === 'ga_till') return { name: 'gå', value: String(arg.url || '').slice(0, 2000) };
+    if (namn === 'scrolla') return { name: 'scrolla', value: String(arg.riktning || 'ned') };
+    if (namn === 'tillbaka') return { name: 'tillbaka', value: '' };
+    return null;
+  }
+  const FLIK_INSTRUKTION = '\nDu ser användarens öppna flik i blocket AKTUELL FLIK och kan styra den med verktygen klicka, skriv, tangent, ga_till, scrolla och tillbaka ' +
+    '(nummer = elementets nummer i ELEMENT). Använd dem när användaren ber dig göra något på sidan – läs aldrig flikens adress med read_page, du har redan sidan. ' +
+    'Efter varje handling får du en ny bild av sidan och fortsätter tills uppgiften är klar; svara då utan verktyg och säg kort vad du gjorde. ' +
+    'Lösenord, BankID och kortuppgifter fyller användaren alltid i själv. Köp-/betala-knappen får du klicka på – webbläsaren frågar användaren först. ' +
+    'Ber användaren dig göra något på sidan: gör det DIREKT med verktygen i samma svar – fråga aldrig "ska jag…?" och skriv aldrig att du ska göra något utan att anropa verktyget. ' +
+    'Nämn aldrig elementnummer eller ELEMENT-listan i texten, säg vad knappen/länken heter. Rabattkoder: kolla först själva sajten (banners, Om oss, kampanjsidor) genom att klicka dig fram, sök på webben sen. Ber användaren dig lägga något i kassan eller handla: lägg varan i varukorgen OCH gå sedan till kassan/varukorgen – uppgiften är klar först när kassan visas.';
   function webbInstruktion() {
     const idag = new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Stockholm', weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
     return `Dagens datum är ${idag}. Du har verktygen web_search och read_page och kan alltså söka på webben själv.\n` +
