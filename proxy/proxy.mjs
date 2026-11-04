@@ -186,7 +186,9 @@ function skickaFil(req, res, fil, extra = {}) {
     const typ = TYPER[path.extname(fil).toLowerCase()] || 'application/octet-stream';
     const etag = `"${st.size.toString(36)}-${Math.floor(st.mtimeMs).toString(36)}"`;
     const huvud = { 'Content-Type': typ, ETag: etag, ...SAKERHET, ...extra };
-    if (!huvud['Cache-Control']) huvud['Cache-Control'] = typ.startsWith('text/html') ? 'no-cache' : 'public, max-age=3600';
+    // Sidan och dess eget js/css har inga versionsnummer i adressen: fråga alltid servern (ETag), annars
+    // ligger gamla skript kvar i Cloudflare och webbläsaren i timmar efter en ändring
+    if (!huvud['Cache-Control']) huvud['Cache-Control'] = /^text\/(html|css|javascript)/.test(typ) ? 'no-cache' : 'public, max-age=3600';
     if (req.headers['if-none-match'] === etag) { res.writeHead(304, huvud); return res.end(); }
     huvud['Content-Length'] = st.size;
     res.writeHead(200, huvud);
