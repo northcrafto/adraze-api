@@ -13,6 +13,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
+import net from 'node:net';
+import util from 'node:util';
+import dnsP from 'node:dns/promises';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
@@ -20,6 +23,7 @@ import { server as wisp, logging } from '@mercuryworkshop/wisp-js/server';
 
 const require = createRequire(import.meta.url);
 const F = require('./filtermotor.cjs');
+const { WebSocketServer } = require('ws');   // samma ws som wisp-js själv använder
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PROXY_PORT || 8495);
 const HOST = process.env.PROXY_HOST || '127.0.0.1';
@@ -43,11 +47,14 @@ function laddaRegler() {
   const kos = las('data/cosmetic.json');
   kos.genericHide = new Set(kos.genericHideExceptions || []);
   const kak = las('data/kakor.json');
-  regler = {
+  const nya = {
     version, sida: byggSidskript(), json, gz: zlib.gzipSync(json, { level: 9 }), br: zlib.brotliCompressSync(json),
-    server: new F.Matchare([], k.vardar), kos, kak, css: new Map(),
+    server: new F.Matchare([], k.vardar), kos, kak, css: new Map(), cssJobb: new Map(),
     genericCss: cssAv(kos.generic), kakGenericCss: cssAv(kak.generic),
   };
+  // Värdar som reglerna inte nämner (de allra flesta, och alla påhittade) får samma färdigkomprimerade post
+  nya.cssStandard = komprimeraSynk(byggCss(nya, []));
+  regler = nya;
   console.log(`regler ${version}: ${k.regler.length} till workern, värdar på servern`, Object.fromEntries(Object.entries(k.vardar).map(([a, b]) => [a, b.length])));
 }
 let reglernasTid = 0;
@@ -105,9 +112,11 @@ function cssAv(selektorer) {
   for (let i = 0; i < selektorer.length; i += 100) css += selektorer.slice(i, i + 100).join(',\n') + '{display:none!important}\n';
   return css;
 }
+// Reglerna är vanliga objekt från JSON: slå bara upp egna nycklar, så att t.ex. h=constructor inte når Object.prototype
+const har = (o, n) => !!o && Object.hasOwn(o, n);
 function stilCss(k, nivaer, undantag) {
   let css = '';
-  for (const n of nivaer) for (const [sel, decl] of k.styles?.[n] || []) if (!undantag.has(`${sel}:style(${decl})`)) css += `${sel}{${decl}}\n`;
+  for (const n of nivaer) if (har(k.styles, n)) for (const [sel, decl] of k.styles[n]) if (!undantag.has(`${sel}:style(${decl})`)) css += `${sel}{${decl}}\n`;
   return css;
 }
 const KAK_UPPLAS = `html.sp-message-open,body.didomi-popup-open,html.didomi-popup-open,body.qc-cmp-ui-showing,html.qc-cmp-ui-showing,
@@ -116,24 +125,48 @@ body.cky-modal-open,html.cmpbox-open,body.cmplz-cookiebanner-open{overflow:auto!
 html.sp-message-open body{overflow:auto!important;position:static!important}\n`;
 function delCss(k, nivaer, generic, genericCss, medGeneric) {
   const undantag = new Set();
-  for (const n of nivaer) for (const s of k.exceptions?.[n] || []) undantag.add(s);
+  for (const n of nivaer) if (har(k.exceptions, n)) for (const s of k.exceptions[n]) undantag.add(s);
   const specifika = [];
-  for (const n of nivaer) for (const s of k.specific?.[n] || []) if (!undantag.has(s)) specifika.push(s);
+  for (const n of nivaer) if (har(k.specific, n)) for (const s of k.specific[n]) if (!undantag.has(s)) specifika.push(s);
   let css = (specifika.length ? cssAv(specifika) : '') + stilCss(k, nivaer, undantag);
   if (medGeneric) css += undantag.size ? cssAv(generic.filter((s) => !undantag.has(s))) : genericCss;
   return css;
 }
+function byggCss(r, nivaer) {
+  return delCss(r.kos, nivaer, r.kos.generic, r.genericCss, !nivaer.some((n) => r.kos.genericHide.has(n)))
+    + delCss(r.kak, nivaer, r.kak.generic, r.kakGenericCss, true) + KAK_UPPLAS;
+}
+// Bara nivåer som reglerna nämner påverkar CSS:en. De är cachenyckeln, så ett slumpat värdnamn kostar ett uppslag
+// i stället för en egen komprimering och en egen post i minnet.
+function cssNivaer(r, host) {
+  return F.foraldrar(host).filter((n) => r.kos.genericHide.has(n) || [r.kos, r.kak].some((k) => har(k.specific, n) || har(k.exceptions, n) || har(k.styles, n)));
+}
+const etagAv = (css) => '"' + crypto.createHash('sha1').update(css).digest('hex').slice(0, 16) + '"';
+const BR5 = { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 5 } };
+const komprimeraSynk = (css) => ({ gz: zlib.gzipSync(css), br: zlib.brotliCompressSync(css, BR5), etag: etagAv(css) });
+const gzipAsync = util.promisify(zlib.gzip), brotliAsync = util.promisify(zlib.brotliCompress);
+const CSS_CACHE_MAX = 300, KOMPRIMERINGAR_MAX = 2;
+let komprimeringar = 0;
+// Ger posten direkt eller ett löfte om den. Komprimeringen görs i trådpoolen, högst två åt gången; är det fullt
+// skickas CSS:en okomprimerad och utan cache, så att händelseloopen aldrig väntar på en komprimering.
 function cssFor(host) {
   const r = regler;
-  let ut = r.css.get(host);
-  if (ut) return ut;
-  const nivaer = F.foraldrar(host);
-  const css = delCss(r.kos, nivaer, r.kos.generic, r.genericCss, !nivaer.some((n) => r.kos.genericHide.has(n)))
-    + delCss(r.kak, nivaer, r.kak.generic, r.kakGenericCss, true) + KAK_UPPLAS;
-  ut = { gz: zlib.gzipSync(css), br: zlib.brotliCompressSync(css, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 5 } }), etag: '"' + crypto.createHash('sha1').update(css).digest('hex').slice(0, 16) + '"' };
-  r.css.set(host, ut);
-  if (r.css.size > 3000) r.css.delete(r.css.keys().next().value);
-  return ut;
+  const nivaer = cssNivaer(r, host);
+  if (!nivaer.length) return r.cssStandard;
+  const nyckel = nivaer.join(',');
+  const klar = r.css.get(nyckel) || r.cssJobb.get(nyckel);
+  if (klar) return klar;
+  const css = byggCss(r, nivaer);
+  if (komprimeringar >= KOMPRIMERINGAR_MAX) return { raw: Buffer.from(css), etag: etagAv(css), tillfallig: true };
+  komprimeringar++;
+  const jobb = Promise.all([gzipAsync(css), brotliAsync(css, BR5)]).then(([gz, br]) => {
+    const post = { gz, br, etag: etagAv(css) };
+    r.css.set(nyckel, post);
+    if (r.css.size > CSS_CACHE_MAX) r.css.delete(r.css.keys().next().value);
+    return post;
+  }).finally(() => { komprimeringar--; r.cssJobb.delete(nyckel); });
+  r.cssJobb.set(nyckel, jobb);
+  return jobb;
 }
 
 // ---------- Wisp: servern ansluter bara dit vi tillåter ----------
@@ -141,6 +174,8 @@ const EGNA = /(^|\.)(proxy\.adraze\.app|localhost|ts\.net|local|internal|lan|hom
 const statistik = { stoppade: 0, anslutningar: 0, start: Date.now() };
 wisp.options.hostname_blacklist = [{
   test(host) {
+    // Samma namn med avslutande punkt ("proxy.adraze.app.") eller versaler ska stoppas likadant
+    host = String(host).toLowerCase().replace(/\.+$/, '');
     if (EGNA.test(host)) return true;
     const kat = regler?.server.vard(host);
     if (kat) { statistik.stoppade++; return true; }
@@ -154,9 +189,31 @@ wisp.options.allow_private_ips = false;
 wisp.options.allow_loopback_ips = false;
 wisp.options.stream_limit_total = 300;
 wisp.options.stream_limit_per_host = 40;
-wisp.options.dns_method = 'resolve';
-wisp.options.dns_servers = ['1.1.1.2', '1.0.0.2'];  // Cloudflares DNS med skadeprogramsfilter
-wisp.options.dns_result_order = 'ipv4first';
+// Egen namnupplösning (samma som wisp-js 'resolve' med ipv4first) som bara släpper igenom publika adresser,
+// både IPv4 och IPv6 (där bara global unicast). Både filtret och själva anslutningen slår upp namnet här, så
+// adressen som kontrolleras är alltid den som används.
+const ICKE_PUBLIK = new net.BlockList();
+for (const [nat, bitar] of [['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12],
+  ['192.0.0.0', 24], ['192.0.2.0', 24], ['192.88.99.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['198.51.100.0', 24], ['203.0.113.0', 24], ['224.0.0.0', 3]]) ICKE_PUBLIK.addSubnet(nat, bitar, 'ipv4');
+for (const [nat, bitar] of [['2001::', 23], ['2001:db8::', 32], ['2002::', 16], ['3fff::', 20]]) ICKE_PUBLIK.addSubnet(nat, bitar, 'ipv6');
+function arPublik(ip) {
+  ip = String(ip || '');
+  if (net.isIPv4(ip)) return !ICKE_PUBLIK.check(ip, 'ipv4');
+  if (!net.isIPv6(ip) || ip.includes('%')) return false;
+  // IPv6: bara global unicast (2000::/3), utom delarna ovan som är reserverade eller pekar vidare mot IPv4
+  if ((parseInt(ip.split(':')[0] || '0', 16) & 0xe000) !== 0x2000) return false;
+  try { return !ICKE_PUBLIK.check(ip, 'ipv6'); } catch { return false; }
+}
+const DNS = new dnsP.Resolver();
+DNS.setServers(['1.1.1.2', '1.0.0.2']);  // Cloudflares DNS med skadeprogramsfilter
+async function slaUppPublik(host) {
+  let adr;
+  try { adr = (await DNS.resolve4(host))[0]; if (!adr) throw new Error('ingen A-post'); }
+  catch { adr = (await DNS.resolve6(host))[0]; if (!adr) throw new Error('address not resolved'); }
+  if (!arPublik(adr)) throw new Error('blocked_address');
+  return adr;
+}
+wisp.options.dns_method = slaUppPublik;
 wisp.options.parse_real_ip_from = ['127.0.0.1', '::1'];
 wisp.options.wisp_motd = 'AdRaze Proxy';
 
@@ -243,6 +300,7 @@ async function hamtaTillCache(fil, kalla, max, typer) {
     const r = await fetch(kalla, { redirect: 'follow', signal: AbortSignal.timeout(15000), headers: { 'User-Agent': 'AdRaze-Proxy/1.0 (+https://proxy.adraze.app)' } });
     const typ = (r.headers.get('content-type') || '').split(';')[0].trim();
     if (!r.ok || !typer.test(typ)) throw new Error('svar ' + r.status + ' ' + typ);
+    if (Number(r.headers.get('content-length')) > max) throw new Error('för stor');
     const data = Buffer.from(await r.arrayBuffer());
     if (data.length > max) throw new Error('för stor');
     fs.writeFileSync(fil + '.tmp', data); fs.renameSync(fil + '.tmp', fil);
@@ -251,10 +309,12 @@ async function hamtaTillCache(fil, kalla, max, typer) {
   pagaende.set(fil, jobb);
   return jobb;
 }
-async function skickaExtern(req, res, fil, kalla, max, typer, livstid) {
-  const st = fs.statSync(fil, { throwIfNoEntry: false });
+async function skickaExtern(req, res, fil, kalla, max, typer, livstid, vidMiss) {
+  let st;
+  try { st = fs.statSync(fil, { throwIfNoEntry: false }); } catch { return skickaFel(req, res, 404); }
   if (!st || Date.now() - st.mtimeMs > livstid * 1000) {
-    try { await hamtaTillCache(fil, kalla, max, typer); } catch { if (!st) return skickaFel(req, res, 404); }   // gammal kopia duger
+    try { await hamtaTillCache(fil, kalla, max, typer); if (!st) vidMiss?.(true); }
+    catch { if (!st) { vidMiss?.(false); return skickaFel(req, res, 404); } }   // gammal kopia duger
   }
   try {
     const typ = fs.readFileSync(fil + '.typ', 'utf8');
@@ -264,11 +324,67 @@ async function skickaExtern(req, res, fil, kalla, max, typer, livstid) {
   } catch { skickaFel(req, res, 404); }
 }
 
+// Genvägsikoner: högst IKON_MAX värdar på disk (de äldsta tas bort), inget som inte hämtats om på 30 dygn,
+// misslyckade värdar frågas inte om på en timme, och varje IP får högst 120 nya hämtningar per 10 minuter.
+const IKONDIR = path.join(EXTCACHE, 'ikon');
+const IKON_MAX = 5000, IKON_ALDER = 30 * 86_400_000, IKON_MISS_TTL = 3_600_000;
+const ikonMiss = new Map();
+let ikonAntal = 0;
+function rensaIkoner(behall) {
+  const filer = [];
+  for (const f of fs.readdirSync(IKONDIR)) {
+    if (f.endsWith('.typ')) continue;
+    try { filer.push([f, fs.statSync(path.join(IKONDIR, f)).mtimeMs]); } catch {}
+  }
+  filer.sort((a, b) => a[1] - b[1]);
+  const gammal = Date.now() - IKON_ALDER;
+  let i = 0;
+  for (; i < filer.length && (filer.length - i > behall || filer[i][1] < gammal || filer[i][0].endsWith('.tmp')); i++) {
+    for (const f of [filer[i][0], filer[i][0] + '.typ']) try { fs.unlinkSync(path.join(IKONDIR, f)); } catch {}
+  }
+  ikonAntal = filer.length - i;
+}
+try { rensaIkoner(IKON_MAX); } catch (e) { console.error('ikoner', e.message); }
+setInterval(() => { try { rensaIkoner(IKON_MAX); } catch (e) { console.error('ikoner', e.message); } }, 6 * 3_600_000).unref();
+const traffar = new Map();
+function begransad(nyckel, max, ms) {
+  const t = Date.now(), lista = (traffar.get(nyckel) || []).filter((x) => t - x < ms);
+  const over = lista.length >= max;
+  if (!over) lista.push(t);
+  traffar.set(nyckel, lista);
+  return over;
+}
+setInterval(() => { const t = Date.now(); for (const [k, v] of traffar) if (!v.some((x) => t - x < 3_600_000)) traffar.delete(k); }, 600_000).unref();
+async function skickaIkon(req, res, vard) {
+  const fil = path.join(IKONDIR, vard);
+  if (!fs.existsSync(fil)) {
+    const miss = ikonMiss.get(vard);
+    if (miss && Date.now() - miss < IKON_MISS_TTL) return skickaFel(req, res, 404);
+    if (begransad('ikon:' + ipAv(req), 120, 600_000)) return skickaFel(req, res, 429);
+    if (pagaende.size >= 16) return skickaFel(req, res, 503);
+  }
+  return skickaExtern(req, res, fil, `https://icons.duckduckgo.com/ip3/${vard}.ico`, 400 << 10, /^image\//, 7 * 86400, (ok) => {
+    if (!ok) {
+      ikonMiss.set(vard, Date.now());
+      if (ikonMiss.size > 10_000) ikonMiss.delete(ikonMiss.keys().next().value);
+    } else if (++ikonAntal > IKON_MAX) rensaIkoner(Math.floor(IKON_MAX * 0.9));
+  });
+}
+
+// Ett fel i en enskild förfrågan ska aldrig ta ned hela proxyn: logga och svara (eller stäng) bara den
+function misslyckad(req, res, kod = 404) {
+  return (e) => {
+    if (kod >= 500) console.error('förfrågan', req.method, String(req.url).slice(0, 200), e?.message || e);
+    try { if (!res.headersSent) skickaFel(req, res, kod); else res.destroy(); } catch { res.destroy(); }
+  };
+}
 const server = http.createServer((req, res) => {
-  let u;
-  try { u = new URL(req.url, 'http://x'); } catch { return skickaFel(req, res, 400); }
+  try { hantera(req, res); } catch (e) { misslyckad(req, res, 500)(e); }
+});
+function hantera(req, res) {
+  let u, p;
+  try { u = new URL(req.url, 'http://x'); p = decodeURIComponent(u.pathname); } catch { return skickaFel(req, res, 400); }
   if (req.method !== 'GET' && req.method !== 'HEAD') return skickaFel(req, res, 405);
-  const p = decodeURIComponent(u.pathname);
 
   if (p === '/sw.js') return skickaFil(req, res, path.join(WEBB, 'sw.js'), { 'Cache-Control': 'no-cache', 'Service-Worker-Allowed': '/' });
   if (p === '/adraze/sida.js') {
@@ -284,8 +400,10 @@ const server = http.createServer((req, res) => {
   if (p === '/adraze/k.css') {
     const host = String(u.searchParams.get('h') || '').toLowerCase();
     if (!/^[a-z0-9.-]{1,253}$/.test(host)) return skickaFel(req, res, 400);
+    const svara = (c) => skickaKomprimerat(req, res, 'text/css; charset=utf-8', c, { ETag: c.etag, 'Cache-Control': c.tillfallig ? 'no-cache' : 'public, max-age=86400', 'Access-Control-Allow-Origin': '*' });
     const c = cssFor(host);
-    return skickaKomprimerat(req, res, 'text/css; charset=utf-8', c, { ETag: c.etag, 'Cache-Control': 'public, max-age=86400', 'Access-Control-Allow-Origin': '*' });
+    if (typeof c.then === 'function') return void c.then(svara).catch(misslyckad(req, res, 500));
+    return svara(c);
   }
   if (p.startsWith('/adraze/stubbar/')) {
     const fil = inom(path.join(TILLAGG, 'stubbar'), p.slice('/adraze/stubbar/'.length));
@@ -301,10 +419,12 @@ const server = http.createServer((req, res) => {
   if (bm) {
     const w = String(u.searchParams.get('w') || '1920');
     if (!bildIds.has(bm[1] + '/' + bm[2]) || !BREDDER.has(w)) return skickaFel(req, res, 404);
-    return skickaExtern(req, res, path.join(EXTCACHE, 'bild', `${bm[1]}-${w}`), `https://images.pexels.com/photos/${bm[1]}/${bm[2]}?auto=compress&cs=tinysrgb&w=${w}`, 6 << 20, /^image\/(jpeg|png|webp)$/, 30 * 86400);
+    return void skickaExtern(req, res, path.join(EXTCACHE, 'bild', `${bm[1]}-${w}`), `https://images.pexels.com/photos/${bm[1]}/${bm[2]}?auto=compress&cs=tinysrgb&w=${w}`, 6 << 20, /^image\/(jpeg|png|webp)$/, 30 * 86400)
+      .catch(misslyckad(req, res));
   }
   const im = /^\/adraze\/ikon\/([a-z0-9-]{1,63}(?:\.[a-z0-9-]{1,63}){1,6})$/.exec(p.toLowerCase());
-  if (im) return skickaExtern(req, res, path.join(EXTCACHE, 'ikon', im[1]), `https://icons.duckduckgo.com/ip3/${im[1]}.ico`, 400 << 10, /^image\//, 7 * 86400);
+  // Värdnamnet blir filnamn på disken, och med .typ/.tmp måste det rymmas inom filsystemets 255 tecken
+  if (im) return im[1].length > 250 ? skickaFel(req, res, 404) : void skickaIkon(req, res, im[1]).catch(misslyckad(req, res));
   if (p === '/adraze/status') {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...SAKERHET });
     return res.end(JSON.stringify({ ok: true, regler: regler.version, anslutna: aktiva.totalt, stoppade: statistik.stoppade, sedan: statistik.start }));
@@ -332,9 +452,23 @@ const server = http.createServer((req, res) => {
     'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-src 'self'; worker-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'",
     'X-Frame-Options': 'DENY',
   } : {});
-});
+}
 
 // ---------- websockets: begränsa per IP ----------
+// Egen websocket-server för /wisp/ (i stället för wisp-js routeRequest), så att vi själva bestämmer största
+// ramstorlek. Wisp-ramar är i praktiken några kB.
+const wsServer = new WebSocketServer({ noServer: true, maxPayload: 1 << 20 });
+async function korWisp(ws, req) {
+  ws.binaryType = 'arraybuffer';
+  // Ett fel på en enskild anslutning (t.ex. för stor ram) ska bara stänga just den
+  ws.on('error', () => {});
+  const wisp_version = req.headers['sec-websocket-protocol'] && wisp.options.wisp_version === 2 ? 2 : 1;
+  const conn = new wisp.ServerConnection(ws, '/wisp/', { wisp_version });
+  try { await conn.setup(); await conn.run(); } catch (e) {
+    try { ws.close(); } catch {}
+    if (!/^(HandshakeError|AccessDeniedError)$/.test(e?.constructor?.name || '')) console.error('wisp', e?.message || e);
+  }
+}
 const aktiva = { perIp: new Map(), totalt: 0 };
 server.on('upgrade', (req, socket, head) => {
   const p = (req.url || '').split('?')[0];
@@ -359,9 +493,7 @@ server.on('upgrade', (req, socket, head) => {
   };
   socket.on('close', slut);
   socket.on('error', slut);
-  // wisp-js läser riktiga IP:t ur X-Forwarded-For/X-Real-IP; Cloudflare-IP:t är det som gäller
-  if (req.headers['cf-connecting-ip']) req.headers['x-real-ip'] = String(req.headers['cf-connecting-ip']);
-  wisp.routeRequest(req, socket, head);
+  wsServer.handleUpgrade(req, socket, head, (ws) => { korWisp(ws, req); });
 });
 
 kollaRegler();
@@ -369,5 +501,9 @@ setInterval(kollaRegler, 10 * 60_000).unref();
 if (!regler) { console.error('kunde inte läsa reglerna i', TILLAGG); process.exit(1); }
 
 server.keepAliveTimeout = 65_000;
-server.listen(PORT, HOST, () => console.log(`AdRaze Proxy på http://${HOST}:${PORT}`));
+server.listen(PORT, HOST, () => {
+  console.log(`AdRaze Proxy på http://${HOST}:${PORT}`);
+  // Ett löfte som ingen fångar ska bara loggas, inte ta ned proxyn för alla (läggs in först när servern är uppe)
+  process.on('unhandledRejection', (e) => console.error('Ohanterat avvisat löfte:', e?.message || e));
+});
 for (const s of ['SIGTERM', 'SIGINT']) process.on(s, () => { server.close(); process.exit(0); });
