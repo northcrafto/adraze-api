@@ -48,6 +48,19 @@ if (!q("SELECT 1 FROM pragma_table_info('devices') WHERE name='install_id'").get
 if (!q("SELECT 1 FROM pragma_table_info('users') WHERE name='namn'").get()) db.exec('ALTER TABLE users ADD COLUMN namn TEXT');
 // Profilbild: färdigbeskuren JPEG (256×256) som data-URL, visas på kontosidan, i webbläsaren och i chatten
 if (!q("SELECT 1 FROM pragma_table_info('users') WHERE name='avatar'").get()) db.exec('ALTER TABLE users ADD COLUMN avatar TEXT');
+// users.id saknar AUTOINCREMENT, så SQLite skulle ge ett raderat kontos id (om det var det högsta) till nästa nya
+// konto, och allt som pekar på id:t utan FK (synk, support, chattgrupper, rapporter) skulle hamna hos fel person.
+// Nya konton får därför alltid ett id över det högsta som någonsin delats ut (id_hogvatten, hålls av en trigger).
+db.exec(`CREATE TABLE IF NOT EXISTS id_hogvatten(tabell TEXT PRIMARY KEY, max_id INTEGER NOT NULL);
+CREATE TRIGGER IF NOT EXISTS users_id_hogvatten AFTER INSERT ON users BEGIN
+  INSERT OR REPLACE INTO id_hogvatten(tabell, max_id)
+    VALUES('users', MAX(NEW.id, COALESCE((SELECT max_id FROM id_hogvatten WHERE tabell='users'), 0)));
+END;`);
+function nyttKonto(f) {
+  return q(`INSERT INTO users(id,email,pass,google_sub,verified,namn,created_at) VALUES(
+    MAX(COALESCE((SELECT max_id FROM id_hogvatten WHERE tabell='users'), 0), COALESCE((SELECT MAX(id) FROM users), 0)) + 1, ?,?,?,?,?,?)`)
+    .run(f.email, f.pass ?? null, f.google_sub ?? null, f.verified, f.namn ?? null, now());
+}
 // Familj: barnkonton tillhör en förälder och loggar in i webbläsaren med sin barnkod + en kod som mejlas till föräldern
 db.exec(`CREATE TABLE IF NOT EXISTS barn(id TEXT PRIMARY KEY, foralder_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   namn TEXT NOT NULL, alder INTEGER NOT NULL, kod TEXT UNIQUE NOT NULL, blocklista TEXT NOT NULL DEFAULT '[]', tillat TEXT NOT NULL DEFAULT '[]',
@@ -97,11 +110,23 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&
 // Citatförslag från kontosidan går hit
 const FORSLAG_TILL = process.env.FORSLAG_TILL || 'cetoari9@gmail.com';
 const MAIL_PER_DAG = Number(process.env.MAIL_PER_DAG || 150);
-let mejlIdag = { dag: '', n: 0 };
-async function skickaMejl(till, amne, html, text, svaraTill) {
+// Dygnsbudgeten delas upp per mejlklass och sparas i databasen (en omstart nollar den inte):
+//  oppen  – koder som vem som helst kan begära till en adress (registrering, glömt lösenord)
+//  drift  – supportärenden och citatförslag
+//  konto  – inloggningskod efter rätt lösenord, familjekoder och teamets svar i support
+// oppen och drift har egna tak, så de kan aldrig ta det som konto behöver; konto får resten av totalen.
+const MAIL_KLASSTAK = { oppen: Number(process.env.MAIL_OPPEN_PER_DAG || 60), drift: Number(process.env.MAIL_DRIFT_PER_DAG || 40) };
+db.exec('CREATE TABLE IF NOT EXISTS mejl_kvot(dag TEXT NOT NULL, klass TEXT NOT NULL, n INTEGER NOT NULL, PRIMARY KEY(dag, klass))');
+function taMejlKvot(klass) {
   const dag = new Date().toISOString().slice(0, 10);
-  if (mejlIdag.dag !== dag) mejlIdag = { dag, n: 0 };
-  if (++mejlIdag.n > MAIL_PER_DAG) { console.error('Mejltaket nått för i dag'); return false; }
+  const rader = q('SELECT klass, n FROM mejl_kvot WHERE dag=?').all(dag);
+  const totalt = rader.reduce((s, r) => s + r.n, 0), egen = rader.find((r) => r.klass === klass)?.n || 0;
+  if (totalt >= MAIL_PER_DAG || egen >= (MAIL_KLASSTAK[klass] ?? Infinity)) return false;
+  q('INSERT INTO mejl_kvot(dag,klass,n) VALUES(?,?,1) ON CONFLICT(dag,klass) DO UPDATE SET n=n+1').run(dag, klass);
+  return true;
+}
+async function skickaMejl(till, amne, html, text, svaraTill, klass = 'drift') {
+  if (!taMejlKvot(klass)) { console.error(`Mejltaket nått för i dag (${klass})`); return false; }
   // MAIL_LOGG=1: skriv mejlet i loggen i stället för att skicka (för test utan riktiga utskick)
   if (process.env.MAIL_LOGG === '1' || !BREVO_KEY) { console.log('[mejl loggat]', till, amne); return process.env.MAIL_LOGG === '1'; }
   const r = await fetch('https://api.brevo.com/v3/smtp/email', {
@@ -153,12 +178,18 @@ const KODMEJL = {
 };
 
 async function skickaKod(email, syfte) {
-  const rad = q('SELECT sent_at FROM codes WHERE email=? AND purpose=?').get(email, syfte);
+  const rad = q('SELECT * FROM codes WHERE email=? AND purpose=?').get(email, syfte);
   if (rad && now() - rad.sent_at < 45_000) return 'vanta';
+  // Högst 12 koder per adress och dygn, så att ingen kan använda en enda adress för att tömma mejlbudgeten
+  if (begransad(`kodmejl:${email}`, 12, 86_400_000)) return 'tak';
   const kod = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
   q('INSERT OR REPLACE INTO codes(email,purpose,hash,tries,expires,sent_at) VALUES(?,?,?,0,?,?)').run(email, syfte, sha(`${syfte}:${kod}`), now() + KOD_TTL, now());
   const m = KODMEJL[syfte](kod);
-  return (await skickaMejl(email, m.amne, m.html, m.text)) ? 'skickad' : 'fel';
+  if (await skickaMejl(email, m.amne, m.html, m.text, undefined, syfte === 'login' ? 'konto' : 'oppen')) return 'skickad';
+  // Mejlet gick inte iväg: lägg tillbaka förra koden (den kan redan ligga i mejlkorgen) eller ta bort den nya
+  if (rad) q('INSERT OR REPLACE INTO codes(email,purpose,hash,tries,expires,sent_at) VALUES(?,?,?,?,?,?)').run(rad.email, rad.purpose, rad.hash, rad.tries, rad.expires, rad.sent_at);
+  else q('DELETE FROM codes WHERE email=? AND purpose=?').run(email, syfte);
+  return 'fel';
 }
 function anvandKod(email, syfte, kod) {
   const rad = q('SELECT * FROM codes WHERE email=? AND purpose=?').get(email, syfte);
@@ -175,6 +206,7 @@ const KODSVAR = { utgangen: [410, 'Koden har gått ut. Be om en ny.'], last: [42
 function krav(svar) { if (svar !== 'ok') throw fel(...KODSVAR[svar]); }
 function kodSkickad(svar) {
   if (svar === 'fel') throw fel(502, 'Vi kunde inte skicka mejlet just nu. Försök igen om en stund.');
+  if (svar === 'tak') throw fel(429, 'Vi har skickat många koder till den adressen i dag. Försök igen i morgon.');
 }
 
 // ---------- kakor och sessioner ----------
@@ -226,6 +258,7 @@ setInterval(() => {
   q('DELETE FROM codes WHERE expires<?').run(now() - 86_400_000);
   // Konton som aldrig bekräftades frigör sin adress efter ett dygn
   q('DELETE FROM users WHERE verified=0 AND created_at<?').run(now() - 86_400_000);
+  q('DELETE FROM mejl_kvot WHERE dag<?').run(new Date(now() - 7 * 86_400_000).toISOString().slice(0, 10));
 }, 3_600_000).unref();
 
 // ---------- Google ----------
@@ -317,17 +350,17 @@ rutt('POST', '/auth/signup', async (req, res, b) => {
   if (begransad(`signup:${ipAv(req)}`, 8, 3_600_000)) throw fel(429, 'För många försök. Vänta en stund.');
   const finns = q('SELECT * FROM users WHERE email=?').get(email);
   if (finns?.verified) throw fel(409, 'Det finns redan ett konto med den mejladressen. Logga in i stället.');
-  if (finns) q('UPDATE users SET pass=? WHERE id=?').run(hashPass(b.password), finns.id);
-  else q('INSERT INTO users(email,pass,verified,created_at) VALUES(?,?,0,?)').run(email, hashPass(b.password), now());
-  const namn = rensaNamn(b.namn);
-  if (namn) q('UPDATE users SET namn=? WHERE email=?').run(namn, email);
+  // En obekräftad registrering skrivs över helt, så att inget namn som någon annan fyllt i följer med
+  const namn = rensaNamn(b.namn) || null;
+  if (finns) q('UPDATE users SET pass=?, namn=? WHERE id=?').run(hashPass(b.password), namn, finns.id);
+  else nyttKonto({ email, pass: hashPass(b.password), verified: 0, namn });
   kodSkickad(await skickaKod(email, 'verify'));
   return { steg: 'kod', syfte: 'verify', email };
 });
 
 rutt('POST', '/auth/verify', async (req, res, b) => {
   const email = normEmail(b.email);
-  if (begransad(`kod:${email}`, 20, 3_600_000)) throw fel(429, 'För många försök. Vänta en stund.');
+  if (begransad(`kod:${email}`, 20, 3_600_000) || begransad(`kodip:${ipAv(req)}`, 60, 3_600_000)) throw fel(429, 'För många försök. Vänta en stund.');
   const u = q('SELECT * FROM users WHERE email=?').get(email);
   if (!u) throw fel(400, 'Fel kod. Kolla mejlet och försök igen.');
   const syfte = u.verified ? 'login' : 'verify';
@@ -369,7 +402,7 @@ rutt('POST', '/auth/google', async (req, res, b) => {
   let u = q('SELECT * FROM users WHERE google_sub=?').get(g.sub) || q('SELECT * FROM users WHERE email=?').get(g.email);
   if (u && !u.verified) q('UPDATE users SET pass=NULL WHERE id=?').run(u.id);
   if (u) q('UPDATE users SET google_sub=?, verified=1 WHERE id=?').run(g.sub, u.id);
-  else q('INSERT INTO users(email,google_sub,verified,created_at) VALUES(?,?,1,?)').run(g.email, g.sub, now());
+  else nyttKonto({ email: g.email, google_sub: g.sub, verified: 1 });
   if (g.namn) q("UPDATE users SET namn=? WHERE google_sub=? AND COALESCE(namn,'')=''").run(g.namn, g.sub);
   u = q('SELECT * FROM users WHERE google_sub=?').get(g.sub);
   return loggaIn(res, u, b);
@@ -390,7 +423,7 @@ rutt('POST', '/auth/forgot', async (req, res, b) => {
 rutt('POST', '/auth/reset', async (req, res, b) => {
   const email = normEmail(b.email);
   const pf = passFel(b.password); if (pf) throw fel(400, pf);
-  if (begransad(`kod:${email}`, 20, 3_600_000)) throw fel(429, 'För många försök. Vänta en stund.');
+  if (begransad(`kod:${email}`, 20, 3_600_000) || begransad(`kodip:${ipAv(req)}`, 60, 3_600_000)) throw fel(429, 'För många försök. Vänta en stund.');
   const u = q('SELECT * FROM users WHERE email=? AND verified=1').get(email);
   if (!u) throw fel(400, 'Fel kod. Kolla mejlet och försök igen.');
   krav(anvandKod(email, 'reset', b.code));
@@ -467,7 +500,14 @@ rutt('POST', '/me/avatar', async (req, res, b) => {
 rutt('POST', '/me/delete', async (req, res, b) => {
   const u = kravInloggad(req);
   if (u.pass && !checkPass(typeof b.password === 'string' ? b.password : '', u.pass)) throw fel(401, 'Fel lösenord.');
-  q('DELETE FROM users WHERE id=?').run(u.id);
+  // Supportärenden (även de som skickats från adressen utan inloggning) raderas med kontot; meddelandena följer med
+  // (CASCADE) och synk tas av en trigger i synk.js
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    q('DELETE FROM support_arenden WHERE user_id=? OR email=?').run(u.id, normEmail(u.email));
+    q('DELETE FROM users WHERE id=?').run(u.id);
+    db.exec('COMMIT');
+  } catch (e) { try { db.exec('ROLLBACK'); } catch {} throw e; }
   laggTillKaka(res, kaka(COOKIE, '', 0));
   laggTillKaka(res, kaka(ENHET, '', 0));
   return {};
@@ -569,10 +609,18 @@ rutt('POST', '/barn/start', async (req, res, b) => {
   const foralder = q('SELECT email FROM users WHERE id=?').get(barn.foralder_id);
   const forra = q('SELECT sent_at FROM barn_godkann WHERE barn_id=?').get(barn.id);
   if (forra && now() - forra.sent_at < 45_000) return { steg: 'godkann', namn: barn.namn, skickad: true };
+  // Tak per förälder och dygn, så att ingen kan använda familjekoder för att tömma mejlbudgeten för inloggningskoder
+  if (begransad(`barnmejl:${barn.foralder_id}`, 30, 86_400_000)) throw fel(429, 'Din förälder har fått många koder i dag. Försök igen i morgon.');
   const engang = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
+  const forraRad = q('SELECT * FROM barn_godkann WHERE barn_id=?').get(barn.id);
   q('INSERT OR REPLACE INTO barn_godkann(barn_id,hash,tries,expires,sent_at) VALUES(?,?,0,?,?)').run(barn.id, sha(`barn:${barn.id}:${engang}`), now() + KOD_TTL, now());
   const m = godkannMejl(barn, engang, String(b.enhet || 'en dator').replace(/[^\p{L}\p{N} ._-]/gu, '').slice(0, 40) || 'en dator');
-  if (!(await skickaMejl(foralder.email, m.amne, m.html, m.text))) throw fel(502, 'Vi kunde inte skicka koden till din förälder just nu. Försök igen om en stund.');
+  if (!(await skickaMejl(foralder.email, m.amne, m.html, m.text, undefined, 'konto'))) {
+    // Inget mejl: lägg tillbaka förra koden eller ta bort den nya, så att nästa försök inte tror att koden redan skickats
+    if (forraRad) q('INSERT OR REPLACE INTO barn_godkann(barn_id,hash,tries,expires,sent_at) VALUES(?,?,?,?,?)').run(forraRad.barn_id, forraRad.hash, forraRad.tries, forraRad.expires, forraRad.sent_at);
+    else q('DELETE FROM barn_godkann WHERE barn_id=?').run(barn.id);
+    throw fel(502, 'Vi kunde inte skicka koden till din förälder just nu. Försök igen om en stund.');
+  }
   return { steg: 'godkann', namn: barn.namn };
 });
 
@@ -740,7 +788,16 @@ const pro = require('./pro.js')({ rutt, q, db, fel, kravInloggad, begransad, now
 require('./support.js')({ rutt, q, db, fel, inloggad, kravInloggad, begransad, now, sha, ipAv, crypto, skickaMejl, mejlLayout, mejlText, esc, normEmail, EMAIL_RE });
 require('./synk.js')({ rutt, q, db, fel, kravInloggad, begransad, now });
 
-http.createServer(async (req, res) => {
+// Startvärde för id_hogvatten: det högsta id som finns eller som någon tabell fortfarande pekar på (rader som
+// blev kvar efter konton som raderades innan högvattnet fanns)
+{
+  const finnsTabell = (t) => !!q("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(t);
+  const pekare = [['users', 'id'], ['synk', 'user_id'], ['support_arenden', 'user_id'], ['chatt_grupper', 'owner_id'], ['chatt_gruppmedlemmar', 'wrapped_by'], ['chatt_rapporter', 'target_id']];
+  const hog = Math.max(0, ...pekare.filter(([t]) => finnsTabell(t)).map(([t, k]) => Number(q(`SELECT MAX(${k}) AS m FROM ${t}`).get().m) || 0));
+  q("INSERT OR REPLACE INTO id_hogvatten(tabell,max_id) VALUES('users', MAX(?, COALESCE((SELECT max_id FROM id_hogvatten WHERE tabell='users'), 0)))").run(hog);
+}
+
+const server = http.createServer(async (req, res) => {
   const origin = req.headers.origin;
   if (origin && ORIGINS.has(origin)) {
     res.setHeader('access-control-allow-origin', origin);
@@ -754,7 +811,9 @@ http.createServer(async (req, res) => {
   }
   // Inloggning med kakor tas bara emot från vår egen sajt (skydd mot CSRF)
   if (req.method === 'POST' && origin && !ORIGINS.has(origin) && !String(origin).startsWith('chrome-extension://')) return skicka(res, 403, { ok: false, error: 'Fel ursprung.' });
-  const sokvag = new URL(req.url, 'http://x').pathname;
+  // En adress som inte går att tolka (t.ex. "//") ska ge 400, inte ett kastat fel utanför try nedan
+  let sokvag;
+  try { sokvag = new URL(req.url, 'http://x').pathname; } catch { return skicka(res, 400, { ok: false, error: 'Ogiltig adress.' }); }
   // Länkkollen är en egen tjänst (kolla/kolla.js, kör en webbläsare); hit kommer bara de anropen och skickas vidare
   if (sokvag === '/kolla' || sokvag.startsWith('/kolla/')) {
     const ut = http.request({ host: '127.0.0.1', port: KOLLA_PORT, method: req.method, path: req.url,
@@ -774,4 +833,11 @@ http.createServer(async (req, res) => {
     if (!e.expose) console.error(req.method, sokvag, e);
     skicka(res, e.status || 500, e.kropp || { ok: false, error: e.expose ? e.message : 'Något gick fel. Försök igen.' });   // e.kropp: rutten bestämmer själv felets form (chatten)
   }
-}).listen(PORT, '127.0.0.1', () => console.log(`adraze-api på 127.0.0.1:${PORT}`));
+});
+server.listen(PORT, '127.0.0.1', () => {
+  console.log(`adraze-api på 127.0.0.1:${PORT}`);
+  // Ett löfte som ingen fångar ska bara loggas, inte döda processen (det nollar alla gränser i minnet).
+  // Läggs in först efter listen, så att fel vid start fortfarande stoppar tjänsten och systemd startar om den.
+  process.on('unhandledRejection', (e) => console.error('Ohanterat avvisat löfte:', e));
+});
+server.on('error', (e) => { console.error('Servern kunde inte starta:', e); process.exit(1); });

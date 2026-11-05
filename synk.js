@@ -9,14 +9,19 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
     rev     INTEGER NOT NULL DEFAULT 1,
     updated INTEGER NOT NULL,
     PRIMARY KEY(user_id, sorts)
-  )`);
+  );
+  -- Raderas kontot raderas dess bokmärken och kortkommandon (även när obekräftade konton rensas)
+  CREATE TRIGGER IF NOT EXISTS synk_konto_raderat AFTER DELETE ON users BEGIN
+    DELETE FROM synk WHERE user_id = OLD.id;
+  END;`);
 
   const SORTER = { bokmarken: 'url', kortkommandon: 'id' };
   const MAX = 5000;             // tak per sort så en trasig klient inte sväller valvet
 
-  function las(userId, sorts) {
-    const rad = q('SELECT data, rev FROM synk WHERE user_id=? AND sorts=?').get(userId, sorts);
-    if (!rad) return { poster: {}, borttagna: {}, rev: 0 };
+  // En rad som är äldre än kontot blev kvar efter ett raderat konto med samma id och räknas som tom
+  function las(u, sorts) {
+    const rad = q('SELECT data, rev, updated FROM synk WHERE user_id=? AND sorts=?').get(u.id, sorts);
+    if (!rad || rad.updated < u.created_at) return { poster: {}, borttagna: {}, rev: 0 };
     let d; try { d = JSON.parse(rad.data); } catch { d = {}; }
     return { poster: d.poster || {}, borttagna: d.borttagna || {}, rev: rad.rev };
   }
@@ -39,7 +44,7 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
     const u = kravInloggad(req);
     const sorts = String((b && b.sorts) || '');
     if (!SORTER[sorts]) throw fel(400, 'Okänd sort.');
-    const state = las(u.id, sorts);
+    const state = las(u, sorts);
     return { rev: state.rev, poster: utatt(state) };
   });
 
@@ -52,7 +57,7 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
     if (!nyckel) throw fel(400, 'Okänd sort.');
     if (begransad(`synk:${u.id}`, 120, 3_600_000)) throw fel(429, 'För många försök. Vänta en stund.');
 
-    const state = las(u.id, sorts);
+    const state = las(u, sorts);
     const nu = now();
     const poster = Array.isArray(b.poster) ? b.poster : [];
     const borttagna = Array.isArray(b.borttagna) ? b.borttagna : [];

@@ -59,18 +59,19 @@ module.exports = ({ rutt, q, db, fel, inloggad, kravInloggad, begransad, now, sh
     if (typ === 'mottaget') {
       const rubrik = en ? `We got your message (#${a.nr})` : `Vi har fått ditt meddelande (#${a.nr})`;
       const t = en ? 'Thanks for writing to AdRaze. We reply as fast as we can, and you will get an email when we do. Keep this email: the button takes you back to your case.' : 'Tack för att du hörde av dig till AdRaze. Vi svarar så snabbt vi kan, och du får ett mejl när vi har gjort det. Spara mejlet: knappen tar dig tillbaka till ärendet.';
-      return skickaMejl(a.email, rubrik, mejlLayout(rubrik, mejlText(esc(t)) + mejlText(`<b>${esc(a.amne)}</b>`) + knapp), `${t}\n\n${lank(nyckel, a.sprak)}`);
+      return skickaMejl(a.email, rubrik, mejlLayout(rubrik, mejlText(esc(t)) + mejlText(`<b>${esc(a.amne)}</b>`) + knapp), `${t}\n\n${lank(nyckel, a.sprak)}`, undefined, 'drift');
     }
     const rubrik = en ? `New reply on your case #${a.nr}` : `Nytt svar i ditt ärende #${a.nr}`;
     const citat = `<tr><td style="padding-top:22px"><div style="border-radius:12px;background:#f6f6f3;padding:16px 18px;font-size:15px;line-height:1.65;color:#17171a">${stycken(svar)}</div></td></tr>`;
-    return skickaMejl(a.email, rubrik, mejlLayout(rubrik, citat + knapp), `${svar}\n\n${en ? 'Reply here' : 'Svara här'}: ${lank(nyckel, a.sprak)}`);
+    // Teamets svar räknas mot kontobudgeten, så att en flod av nya ärenden inte kan stoppa svaren
+    return skickaMejl(a.email, rubrik, mejlLayout(rubrik, citat + knapp), `${svar}\n\n${en ? 'Reply here' : 'Svara här'}: ${lank(nyckel, a.sprak)}`, undefined, 'konto');
   }
   function mejlTeam(a, text, nytt) {
     const rubrik = `${nytt ? 'Nytt supportärende' : 'Nytt svar från kunden'} #${a.nr}: ${a.amne}`.slice(0, 160);
     const html = mejlLayout(rubrik, mejlText(`${esc(a.namn || a.email)} &lt;${esc(a.email)}&gt;<br>Kategori: ${esc(a.kategori)}`)
       + `<tr><td style="padding-top:22px"><div style="border-radius:12px;background:#f6f6f3;padding:16px 18px;font-size:15px;line-height:1.65;color:#17171a">${stycken(text)}</div></td></tr>`
       + `<tr><td align="center" style="padding-top:26px"><a href="${SAJT}/team#${a.nr}" style="display:inline-block;background:#ff4b1f;color:#17171a;text-decoration:none;font-weight:600;font-size:15px;padding:14px 26px;border-radius:999px">Svara i teampanelen</a></td></tr>`);
-    return skickaMejl(TILL, rubrik, html, `${a.namn || ''} <${a.email}>\n${a.kategori}\n\n${text}\n\n${SAJT}/team#${a.nr}`, a.email);
+    return skickaMejl(TILL, rubrik, html, `${a.namn || ''} <${a.email}>\n${a.kategori}\n\n${text}\n\n${SAJT}/team#${a.nr}`, a.email, 'drift');
   }
 
   // ---------- kunden ----------
@@ -117,23 +118,25 @@ module.exports = ({ rutt, q, db, fel, inloggad, kravInloggad, begransad, now, sh
     return { arende: ut(q('SELECT * FROM support_arenden WHERE id=?').get(a.id)) };
   });
 
-  // Inloggade ser sina egna ärenden (kopplade till kontot eller skickade från kontots mejl)
+  // Inloggade ser ärenden de skapat inloggade. Att mejladressen stämmer räcker inte: vem som helst kan skicka ett
+  // ärende i någon annans namn. Ärenden äldre än kontot hör till ett tidigare konto med samma id.
+  const egetArende = (nr, u) => q('SELECT * FROM support_arenden WHERE nr=? AND user_id=? AND skapad>=?').get(String(nr || ''), u.id, u.created_at);
   rutt('GET', '/support/mina', async (req) => {
     const u = kravInloggad(req);
     const rader = q(`SELECT a.nr, a.amne, a.status, a.uppdaterad, (SELECT fran FROM support_meddelanden m WHERE m.arende_id=a.id ORDER BY skapad DESC, id DESC LIMIT 1) AS senast
-      FROM support_arenden a WHERE a.user_id=? OR a.email=? ORDER BY a.uppdaterad DESC LIMIT 50`).all(u.id, u.email);
+      FROM support_arenden a WHERE a.user_id=? AND a.skapad>=? ORDER BY a.uppdaterad DESC LIMIT 50`).all(u.id, u.created_at);
     return { arenden: rader, team: TEAM.has(String(u.email).toLowerCase()) };
   });
   // Ett eget ärende öppnas via kontot i stället för nyckeln
   rutt('POST', '/support/mitt', async (req, res, b) => {
     const u = kravInloggad(req);
-    const a = q('SELECT * FROM support_arenden WHERE nr=? AND (user_id=? OR email=?)').get(String(b.nr || ''), u.id, u.email);
+    const a = egetArende(b.nr, u);
     if (!a) throw fel(404, 'Ärendet finns inte.');
     return { arende: ut(a) };
   });
   rutt('POST', '/support/mitt/svara', async (req, res, b) => {
     const u = kravInloggad(req);
-    const a = q('SELECT * FROM support_arenden WHERE nr=? AND (user_id=? OR email=?)').get(String(b.nr || ''), u.id, u.email);
+    const a = egetArende(b.nr, u);
     if (!a) throw fel(404, 'Ärendet finns inte.');
     const text = rensa(b.text, MAX_TEXT);
     if (text.length < 2) throw fel(400, 'Skriv ett meddelande.');
