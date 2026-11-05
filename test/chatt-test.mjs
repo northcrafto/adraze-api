@@ -86,7 +86,8 @@ r = await api(A, 'POST', '/chatt/users/bubble', { frame: 'hund' }); koll('ogilti
 r = await api(A, 'GET', '/chatt/users/privacy'); koll('privacy standard', r.j.privacy.read_receipts === true && r.j.privacy.requests === 'all', r);
 
 console.log('Uppslag och nyckel');
-r = await api(A, 'GET', '/chatt/users/lookup?username=beta'); koll('lookup Beta', r.j.exists && r.j.id === String(B.id) && r.j.public_key === 'PKb', r);
+r = await api(A, 'GET', '/chatt/users/lookup?username=beta'); koll('lookup Beta (ej kontakt): ingen nyckel eller bild', r.j.exists && r.j.id === String(B.id) && r.j.public_key === null && r.j.avatar === null, r);
+r = await api(A, 'GET', '/chatt/users/lookup?username=alfa'); koll('lookup sig själv: nyckel och bild', r.j.exists && r.j.public_key === 'PKa' && r.j.avatar, r);
 r = await api(A, 'GET', '/chatt/users/lookup?username=finnsinte'); koll('lookup okänd → exists:false', r.s === 200 && r.j.exists === false, r);
 r = await api(A, 'GET', `/chatt/users/key?id=${B.id}`); koll('key utan kontakt → 403 not_contacts', r.s === 403 && r.j.error === 'not_contacts', r);
 r = await api(A, 'GET', `/chatt/users/key?id=${A.id}`); koll('egen key', r.s === 200 && r.j.public_key === 'PKa', r);
@@ -98,6 +99,7 @@ r = await api(A, 'POST', '/chatt/messages/send', { to_id: String(B.id), cipherte
 r = await api(B, 'POST', '/chatt/contacts/accept', { username: 'alfa' }); koll('accept', r.s === 200, r);
 r = await api(A, 'GET', '/chatt/contacts'); koll('kontaktlista med bubbla/avatar', r.j.contacts.length === 1 && r.j.contacts[0].id === String(B.id), r);
 r = await api(A, 'GET', `/chatt/users/key?id=${B.id}`); koll('key efter accept', r.s === 200 && r.j.public_key === 'PKb', r);
+r = await api(A, 'GET', '/chatt/users/lookup?username=beta'); koll('lookup kontakt: nyckel', r.j.exists && r.j.public_key === 'PKb', r);
 r = await api(A, 'GET', `/chatt/users/profile?id=${B.id}`); koll('profil Beta', r.s === 200 && r.j.friends === 1 && r.j.is_self === false && r.j.pro === false, r);
 r = await api(C, 'GET', `/chatt/users/profile?id=${A.id}`); koll('Gamma ser inte Alfas profil', r.s === 403, r);
 await api(B, 'POST', '/chatt/users/privacy', { requests: 'none' });
@@ -134,6 +136,12 @@ r = await api(A, 'GET', `/chatt/messages?with=${B.id}`); koll('borttaget: tom ch
 
 console.log('Bilagor');
 const bild = b64(2_000_000, 'Q');
+db.prepare('INSERT INTO chatt_bilagor(id,sender_id,recipient_id,group_id,ciphertext,bytes,created_at,used) VALUES(?,?,?,?,?,?,?,1)').run('kvot-a', A.id, B.id, null, 'QQ==', 199_000_000, Date.now() - 1000);
+r = await api(A, 'POST', '/chatt/messages/attachment', { to_id: String(B.id), ciphertext: bild }); koll('över dygnstaket för bilder → 413 quota_exceeded', r.s === 413 && r.j.error === 'quota_exceeded', r);
+db.prepare('UPDATE chatt_bilagor SET created_at=? WHERE id=?').run(Date.now() - 2 * 86_400_000, 'kvot-a');
+db.prepare('INSERT INTO chatt_bilagor(id,sender_id,recipient_id,group_id,ciphertext,bytes,created_at,used) VALUES(?,?,?,?,?,?,?,1)').run('kvot-b', A.id, B.id, null, 'QQ==', 300_000_000, Date.now() - 2 * 86_400_000);
+r = await api(A, 'POST', '/chatt/messages/attachment', { to_id: String(B.id), ciphertext: bild }); koll('över totalkvoten (även bundna, gamla) → 413', r.s === 413 && r.j.error === 'quota_exceeded', r);
+db.prepare("DELETE FROM chatt_bilagor WHERE id IN ('kvot-a','kvot-b')").run();
 r = await api(A, 'POST', '/chatt/messages/attachment', { to_id: String(B.id), ciphertext: bild }); koll('ladda upp 2 MB-bilaga', r.s === 200 && /^[a-f0-9]{32}$/.test(r.j.id), r);
 const att = r.j.id;
 r = await api(A, 'POST', '/chatt/messages/attachment', { to_id: String(B.id), ciphertext: b64(2_200_001) }); koll('för stor bilaga → 400', r.s === 400, r);
@@ -199,6 +207,8 @@ r = await api(A, 'POST', '/chatt/messages/send', { to_id: String(B.id), cipherte
 r = await api(A, 'POST', '/chatt/contacts/request', { username: 'Beta' }); koll('ny förfrågan → 403 blocked', r.s === 403 && r.j.error === 'blocked', r);
 r = await api(A, 'POST', '/chatt/messages/typing', { to_id: String(B.id) }); koll('typing till blockerare → 403', r.s === 403, r);
 r = await api(A, 'GET', `/chatt/users/key?id=${B.id}`); koll('nyckel efter block → 403', r.s === 403, r);
+r = await api(A, 'GET', '/chatt/users/lookup?username=beta'); koll('lookup av den som blockerat mig → exists:false', r.s === 200 && r.j.exists === false && !r.j.id && !r.j.avatar, r);
+r = await api(B, 'GET', '/chatt/users/lookup?username=alfa'); koll('lookup av den jag blockerat → exists:false', r.s === 200 && r.j.exists === false, r);
 r = await api(B, 'GET', '/chatt/contacts'); koll('blocked-lista', r.j.blocked.length === 1 && r.j.blocked[0].username === 'Alfa' && r.j.contacts.length === 0, r);
 
 console.log('Rapport');
@@ -237,6 +247,8 @@ const falskt = (await api(A, 'POST', '/chatt/users/recovery/params', { username:
 r = await api(A, 'POST', '/chatt/users/recovery/params', { username: 'Nobody' }); koll('låtsas-salt stabilt', falskt && r.j.salt === falskt, r);
 r = await api(B, 'POST', '/chatt/users/recovery/reveal', { username: 'Beta', rec_auth: 'cmVjYg==' }); koll('reveal rätt lösen', r.j.rec_blob === 'YmxvYg==', r);
 r = await api(A, 'POST', '/chatt/users/recovery/reveal', { username: 'Beta', rec_auth: 'cmVjYg==' }); koll('reveal av annans namn → 403', r.s === 403 && r.j.error === 'invalid_recovery', r);
+for (let i = 0; i < 12; i++) await api({ ...A, ip: `10.77.${i}.1` }, 'POST', '/chatt/users/recovery/reveal', { username: 'Beta', rec_auth: 'ZmVs' });
+r = await api(B, 'POST', '/chatt/users/recovery/reveal', { username: 'Beta', rec_auth: 'cmVjYg==' }); koll('andras fel på mitt namn låser inte min Visa koden', r.s === 200 && r.j.rec_blob === 'YmxvYg==', r);
 r = await api(A, 'POST', '/chatt/users/recovery/set', { login_hash: hash(kod), salt: 'czI=', rec_auth: 'cmE=', rec_blob: 'YmE=' }); koll('recovery/set', r.j.has_recovery === true, r);
 r = await api(A, 'POST', '/chatt/users/recovery/remove', { rec_auth: 'cmE=' }); koll('recovery/remove', r.j.has_recovery === false, r);
 

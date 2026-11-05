@@ -66,7 +66,7 @@ Ingen hemlig kod längre: servern håller en slumpad hemlighet per konto (32 byt
 
 | Metod | Rutt | In | Ut |
 |---|---|---|---|
-| GET | `/chatt/users/lookup?username=` | – | `{exists:false}` eller `{exists:true, id, username, public_key, avatar}` |
+| GET | `/chatt/users/lookup?username=` | – | `{exists:false}` eller `{exists:true, id, username, public_key, avatar}`. `public_key` och `avatar` är `null` om man inte är kontakter (samma regel som `users/key`), och blockerade par får `{exists:false}` |
 | GET | `/chatt/users/key?id=` | – | `{id, username, public_key, avatar}`; `404 not_found`, `403 not_contacts` |
 | GET | `/chatt/users/profile?id=` | – | `{id, username, avatar, bio, created_at, friends, pro:false, is_self}`; `404`, `403 not_contacts` |
 | POST | `/chatt/contacts/request` | `{username}` | `{status:"pending"\|"accepted"}`; `404 user_not_found`, `400 cant_add_self`, `403 blocked`, `403 requests_closed` |
@@ -92,7 +92,7 @@ Ingen hemlig kod längre: servern håller en slumpad hemlighet per konto (32 byt
 
 | Metod | Rutt | In | Ut |
 |---|---|---|---|
-| POST | `/chatt/messages/attachment` | `{ciphertext (≤2 200 000), to_id}` eller `{ciphertext, group_id}` | `{id}` (32 hex); `400 invalid_input`, `403 not_contacts/not_member` |
+| POST | `/chatt/messages/attachment` | `{ciphertext (≤2 200 000), to_id}` eller `{ciphertext, group_id}` | `{id}` (32 hex); `400 invalid_input`, `403 not_contacts/not_member`, `413 quota_exceeded` (bilagor per konto: högst 500 MB totalt och 200 MB per dygn) |
 | GET | `/chatt/messages/attachment?id=` | – | `{ciphertext}`; `404`, `403 forbidden` (bara avsändare, mottagare eller gruppmedlem) |
 | GET | `/chatt/stickers` | – | `{stickers:[{id, bytes, created_at}], max:120}` |
 | GET | `/chatt/stickers?id=` | – | `{ciphertext}`; `404 not_found` (Säkerkolls `GET /stickers/:id`) |

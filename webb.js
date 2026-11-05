@@ -6,7 +6,13 @@ const SOK_URL = process.env.FALK_SOK_URL || 'http://127.0.0.1:8890/search';
 // Bara Google CSE ger vettiga svar från vår instans (Bing ger skräp, resten blockeras/CAPTCHA)
 const SOK_MOTORER = process.env.FALK_SOK_MOTORER || 'google cse';
 
+// IPv6: bara global unicast (2000::/3) räknas som publik, och inte de delar av den som bär eller pekar på
+// en annan adress (Teredo, 6to4) eller är IETF-/dokumentationsadresser. Allt annat (::/8 med ::a.b.c.d,
+// fc00::/7, fe80::/10, fec0::/10, 64:ff9b::/96, multicast …) nekas.
+const ICKE_PUBLIK6 = new _net.BlockList();
+for (const [nat, bitar] of [['2001::', 23], ['2001:db8::', 32], ['2002::', 16], ['3fff::', 20]]) ICKE_PUBLIK6.addSubnet(nat, bitar, 'ipv6');
 function isPublicIp(ip) {
+  ip = String(ip || '');
   if (_net.isIPv4(ip)) {
     const [a, b2] = ip.split('.').map(Number);
     if (a === 0 || a === 10 || a === 127 || a >= 224) return false;
@@ -17,11 +23,11 @@ function isPublicIp(ip) {
     if (a === 198 && (b2 === 18 || b2 === 19)) return false;
     return true;
   }
+  if (!_net.isIPv6(ip) || ip.includes('%')) return false;
   const l = ip.toLowerCase();
-  if (l === '::' || l === '::1' || /^fe[89ab]/.test(l) || l.startsWith('fc') || l.startsWith('fd') || l.startsWith('ff')) return false;
   const m = l.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/); if (m) return isPublicIp(m[1]);
-  if (l.startsWith('::ffff:') || l.startsWith('64:ff9b:')) return false;
-  return true;
+  if ((parseInt(l.split(':')[0] || '0', 16) & 0xe000) !== 0x2000) return false;
+  try { return !ICKE_PUBLIK6.check(l, 'ipv6'); } catch { return false; }
 }
 function safeLookup(host, opts, cb) {
   _dns.lookup(host, { all: true }, (err, addrs) => {
@@ -68,14 +74,71 @@ function decodeEntities(t) {
     return { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' }[l];
   });
 }
+// HTML → text i linjär tid. Varje steg letar framåt från där förra träffen slutade och ger upp så fort
+// det inte kan finnas fler träffar, så trasig eller fientlig HTML (t.ex. tusentals "<a" eller "<script"
+// utan slut) inte kan låsa servern. Resultatet är detsamma som med de enkla regexarna.
+const BLOCK_START = /<(script|style|noscript|svg|template|iframe|head)\b/gi;
+const BLOCK_SLUT = {};
+for (const n of ['script', 'style', 'noscript', 'svg', 'template', 'iframe', 'head']) BLOCK_SLUT[n] = new RegExp(`</${n}>`, 'gi');
+const RADBRYT_START = /<(?:br|\/p|\/div|\/li|\/tr|\/h[1-6]|\/section|\/article|\/table)\b/gi;
+function utanBlock(s) {
+  let ut = '', fran = 0, m;
+  const utanSlut = new Set();
+  BLOCK_START.lastIndex = 0;
+  while ((m = BLOCK_START.exec(s))) {
+    const namn = m[1].toLowerCase();
+    if (utanSlut.has(namn)) continue;
+    const slut = BLOCK_SLUT[namn];
+    slut.lastIndex = BLOCK_START.lastIndex;
+    const e = slut.exec(s);
+    if (!e) { utanSlut.add(namn); continue; }   // inget slut efter här, alltså inte heller efter senare starter
+    ut += s.slice(fran, m.index) + ' ';
+    fran = BLOCK_START.lastIndex = e.index + e[0].length;
+  }
+  return ut + s.slice(fran);
+}
+function utanKommentarer(s) {
+  let ut = '', fran = 0;
+  for (;;) {
+    const a = s.indexOf('<!--', fran); if (a < 0) break;
+    const b = s.indexOf('-->', a + 4); if (b < 0) break;
+    ut += s.slice(fran, a) + ' '; fran = b + 3;
+  }
+  return ut + s.slice(fran);
+}
+// Taggar vars start matchar re ersätts (till och med första '>') med med
+function ersattTaggar(s, re, med) {
+  let ut = '', fran = 0, m;
+  re.lastIndex = 0;
+  while ((m = re.exec(s))) {
+    const gt = s.indexOf('>', re.lastIndex);
+    if (gt < 0) break;
+    ut += s.slice(fran, m.index) + med;
+    fran = re.lastIndex = gt + 1;
+  }
+  return ut + s.slice(fran);
+}
+function utanTaggar(s) {
+  let ut = '', fran = 0, i = 0;
+  for (;;) {
+    const lt = s.indexOf('<', i); if (lt < 0) break;
+    const gt = s.indexOf('>', lt + 1); if (gt < 0) break;
+    if (gt === lt + 1) { i = lt + 1; continue; }   // "<>" är ingen tagg
+    ut += s.slice(fran, lt) + ' ';
+    fran = i = gt + 1;
+  }
+  return ut + s.slice(fran);
+}
+function titelAv(s) {
+  const m = /<title/i.exec(s); if (!m) return '';
+  const gt = s.indexOf('>', m.index + 6); if (gt < 0) return '';
+  const slut = /<\/title>/gi; slut.lastIndex = gt + 1;
+  const e = slut.exec(s);
+  return e ? s.slice(gt + 1, e.index) : '';
+}
 function htmlTillText(html) {
-  const titel = ((html.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || '').trim();
-  const t = html
-    .replace(/<(script|style|noscript|svg|template|iframe|head)\b[\s\S]*?<\/\1>/gi, ' ')
-    .replace(/<!--[\s\S]*?-->/g, ' ')
-    .replace(/<(br|\/p|\/div|\/li|\/tr|\/h[1-6]|\/section|\/article|\/table)\b[^>]*>/gi, '\n')
-    .replace(/<\/t[dh]>/gi, ' | ')
-    .replace(/<[^>]+>/g, ' ');
+  const titel = titelAv(html).trim();
+  const t = utanTaggar(ersattTaggar(utanKommentarer(utanBlock(html)), RADBRYT_START, '\n').replace(/<\/t[dh]>/gi, ' | '));
   const text = decodeEntities(t).replace(/[ \t ]+/g, ' ').replace(/ *\n[\s\n]*/g, '\n').trim();
   return { titel: decodeEntities(titel).replace(/\s+/g, ' '), text };
 }
@@ -91,10 +154,13 @@ async function sok(fraga, antal = 8) {
     .map((x) => ({ titel: String(x.title || '').slice(0, 200), url: x.url, utdrag: String(x.content || '').replace(/\s+/g, ' ').slice(0, 400), datum: x.publishedDate || undefined }));
 }
 
+// Så mycket av sidan som tolkas. Texten kortas ändå till maxTecken, och taket gör tolkningen billig även för
+// enorma sidor (allt sker på API:ts enda tråd).
+const TOLKA_TECKEN = 1_000_000;
 async function lasSida(url, maxTecken = 14_000) {
   const r = await safeGet(url, 3_000_000);
   if (r.type && !/text\/(html|plain)|xhtml|json|xml/.test(r.type)) throw new Error('inte_text');
-  const raw = r.body.toString('utf8');
+  const raw = r.body.toString('utf8').slice(0, TOLKA_TECKEN);
   const { titel, text } = /html|xml/.test(r.type) || /<html|<body/i.test(raw.slice(0, 2000)) ? htmlTillText(raw) : { titel: '', text: raw };
   return { url: r.url, titel, text: text.slice(0, maxTecken) + (text.length > maxTecken ? '\n…(sidan kortad)' : '') };
 }

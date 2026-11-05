@@ -470,8 +470,10 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad, begr
     bas(req, res); recLimit(req, res);
     const u = kravInloggad(req);
     if (!validUsername(b.username) || !isSaneB64(b.rec_auth, HASH_MAX)) throw E(res, 400, 'invalid_input');
-    const ip = ipAv(req), lower = b.username.toLowerCase(), who = 'rec:' + lower;
-    const lock = loginLockStatus(ip, who), nameLock = recNameLocked(lower);
+    // Namnlåset gäller den som frågar (kontot), inte namnet: rutten lyckas bara för ens eget namn, så en
+    // främling ska inte kunna låsa någon annans "Visa koden" genom att gissa fel på deras namn
+    const ip = ipAv(req), lower = b.username.toLowerCase(), who = 'rec:' + lower, lasNyckel = 'id:' + u.id;
+    const lock = loginLockStatus(ip, who), nameLock = recNameLocked(lasNyckel);
     if (lock.locked || nameLock) {
       const wait = Math.max(lock.locked ? lock.retryAfter : 0, nameLock);
       res.setHeader('Retry-After', String(wait));
@@ -480,7 +482,7 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad, begr
     const p = q('SELECT user_id, username, rec_auth, rec_blob FROM chatt_profiler WHERE username_lower=?').get(lower);
     const ok = await recVerify(b.rec_auth, (p && p.rec_auth) || REC_DUMMY);
     if (!p || p.user_id !== u.id || !p.rec_auth || !p.rec_blob || !ok) {
-      registerLoginFail(ip, who); recNameFail(lower);
+      registerLoginFail(ip, who); recNameFail(lasNyckel);
       throw E(res, 403, 'invalid_recovery', 'Fel användarnamn eller lösenord — eller så har kontot inget lösenord sparat.');
     }
     clearLoginFails(ip, who);
@@ -636,24 +638,8 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad, begr
   });
 
   // ---------- länkförhandsvisning: servern hämtar åt avsändaren, SSRF-skyddat ----------
-  function isPublicIp(ip) {
-    if (_net.isIPv4(ip)) {
-      const [a, b2] = ip.split('.').map(Number);
-      if (a === 0 || a === 10 || a === 127 || a >= 224) return false;
-      if (a === 100 && b2 >= 64 && b2 <= 127) return false;       // CGNAT / tailnet
-      if (a === 169 && b2 === 254) return false;
-      if (a === 172 && b2 >= 16 && b2 <= 31) return false;
-      if (a === 192 && (b2 === 168 || ip.startsWith('192.0.0.') || ip.startsWith('192.0.2.'))) return false;
-      if (a === 198 && (b2 === 18 || b2 === 19)) return false;
-      return true;
-    }
-    const l = ip.toLowerCase();
-    if (l === '::' || l === '::1' || /^fe[89ab]/.test(l) || l.startsWith('fc') || l.startsWith('fd') || l.startsWith('ff')) return false;
-    const m = l.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/); if (m) return isPublicIp(m[1]);
-    if (l.startsWith('::ffff:')) return false; // ::ffff:7f00:1 och liknande hex-former
-    if (l.startsWith('64:ff9b:')) return false; // NAT64 kan peka på interna IPv4
-    return true;
-  }
+  // Samma kontroll som Falks sidläsning (webb.js): IPv6 bara global unicast, inga inbäddade/interna former
+  const isPublicIp = require('./webb.js').isPublicIp;
   function safeLookup(host, opts, cb) {
     _dns.lookup(host, { all: true }, (err, addrs) => {
       if (err) return cb(err);
@@ -785,13 +771,16 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad, begr
   // ======================================================================
   // Användare och kontakter
   // ======================================================================
+  // Uppslag på namn (för vänförfrågan). Blockerade par ser varandra som om kontot inte fanns, och bild och
+  // publik nyckel får bara man själv och kontakter (samma regel som /users/key och /users/profile).
   rutt('GET', '/chatt/users/lookup', (req, res) => {
-    profil(req, res);
+    const me = profil(req, res).id;
     const uname = String(query(req).get('username') || '').toLowerCase();
     if (!validUsername(uname)) throw E(res, 400, 'invalid_username');
     const u = q('SELECT p.user_id, p.username, p.public_key, a.avatar FROM chatt_profiler p JOIN users a ON a.id=p.user_id WHERE p.username_lower=?').get(uname);
-    if (!u) return { exists: false };
-    return { exists: true, id: idUt(u.user_id), username: u.username, public_key: u.public_key, avatar: u.avatar || null };
+    if (!u || (u.user_id !== me && isBlockedEither(me, u.user_id))) return { exists: false };
+    const nara = u.user_id === me || areContacts(me, u.user_id);
+    return { exists: true, id: idUt(u.user_id), username: u.username, public_key: nara ? u.public_key : null, avatar: nara ? (u.avatar || null) : null };
   });
 
   rutt('GET', '/chatt/users/key', (req, res) => {
@@ -953,11 +942,20 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad, begr
   });
 
   // ---------- bildbilagor ----------
+  // Tak per konto (tecken chiffertext ≈ byte): totalt och per dygn, så att ingen ensam kan fylla disken.
+  // Indexet låter SQLite summera utan att läsa själva bilderna.
+  const BILAGA_KVOT = Number(process.env.CHATT_BILAGA_KVOT || 500_000_000);
+  const BILAGA_PER_DYGN = Number(process.env.CHATT_BILAGA_PER_DYGN || 200_000_000);
+  db.exec('CREATE INDEX IF NOT EXISTS chatt_bilagor_kvot ON chatt_bilagor(sender_id, created_at, bytes)');
   rutt('POST', '/chatt/messages/attachment', (req, res, b) => {
     grans(req, res, 'bilaga', 400, KVART, 'För många bilder på kort tid. Vänta en stund och försök igen.');
     const me = profil(req, res).id;
     grans(req, res, 'bilaga-anv', 400, KVART, 'För många bilder på kort tid. Vänta en stund och försök igen.', me);
     if (!isSaneB64(b.ciphertext, ATTACHMENT_MAX_B64)) throw E(res, 400, 'invalid_input', 'Bilden är för stor.');
+    const anvant = q('SELECT COALESCE(SUM(bytes),0) AS s FROM chatt_bilagor WHERE sender_id=?').get(me).s;
+    const idag = q('SELECT COALESCE(SUM(bytes),0) AS s FROM chatt_bilagor WHERE sender_id=? AND created_at>?').get(me, now() - 86_400_000).s;
+    if (anvant + b.ciphertext.length > BILAGA_KVOT || idag + b.ciphertext.length > BILAGA_PER_DYGN)
+      throw E(res, 413, 'quota_exceeded', 'Du har skickat väldigt många bilder. Ta bort gamla bilder du har skickat, eller vänta till i morgon.');
     let recipient = null, group = null;
     if (b.to_id != null) {
       recipient = idIn(b.to_id);
@@ -1147,6 +1145,7 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad, begr
 
   rutt('POST', '/chatt/groups/messages', (req, res, b) => {
     const me = profil(req, res).id;
+    grans(req, res, 'gruppmsg-anv', 600, KVART, 'Du skickar väldigt många meddelanden. Vänta en stund och försök igen.', me);
     const gid = gidIn(b.id);
     if (!isMember(gid, me)) throw E(res, 403, 'not_member');
     if (!isSaneB64(b.ciphertext, MESSAGE_MAX_BYTES)) throw E(res, 400, 'invalid_input');
