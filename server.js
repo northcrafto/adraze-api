@@ -500,6 +500,7 @@ rutt('POST', '/me/avatar', async (req, res, b) => {
 rutt('POST', '/me/delete', async (req, res, b) => {
   const u = kravInloggad(req);
   if (u.pass && !checkPass(typeof b.password === 'string' ? b.password : '', u.pass)) throw fel(401, 'Fel lösenord.');
+  await pro.avslutaVidRadering(u);   // Pro i Stripe avslutas först, annars debiteras kunden vidare efter raderingen
   // Supportärenden (även de som skickats från adressen utan inloggning) raderas med kontot; meddelandena följer med
   // (CASCADE) och synk tas av en trigger i synk.js
   db.exec('BEGIN IMMEDIATE');
