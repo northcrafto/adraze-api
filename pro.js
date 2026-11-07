@@ -10,7 +10,45 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
   const AI_BASE = process.env.AI_CHAT_BASE || '';
   const AI_KEY = process.env.AI_CHAT_KEY || '';
   const AI_MODEL = process.env.AI_CHAT_MODEL || '';
-  const AI_PER_DYGN = 300;
+  const AI_MODEL_GRATIS = process.env.AI_CHAT_MODEL_GRATIS || 'qwen/qwen3.7-flash';
+  const DAG = 86_400_000;
+  // Falks kvoter. Perioden börjar vid första frågan och fylls på när den gått ut (eller när planen byts).
+  // Gratis: 50 000 tokens och 2 frågor med webbsökning per 14 dagar. Pro: 2 miljoner tokens per 30 dagar.
+  const KVOT = {
+    gratis: { modell: () => AI_MODEL_GRATIS, tokens: 50_000, period: 14 * DAG, sokfragor: 2, sokPerFraga: 2, lasPerFraga: 2, maxSvar: 1500, maxTecken: 60_000, perDygn: 60 },
+    pro: { modell: () => AI_MODEL, tokens: 2_000_000, period: 30 * DAG, sokfragor: Infinity, sokPerFraga: 8, lasPerFraga: 6, maxSvar: 4000, maxTecken: 280_000, perDygn: 300 },
+  };
+  // Nödbroms för hela servern: så här många tokens per dygn (alla användare tillsammans) och anrop till AI:n per minut.
+  // Räknat på dyraste leverantören blir 20 miljoner tokens högst runt 50 kr per dygn.
+  const DAG_TAK = Number(process.env.FALK_DAG_TAK || 20_000_000);
+  const MINUT_TAK = Number(process.env.FALK_MINUT_TAK || 120);
+  db.exec('CREATE TABLE IF NOT EXISTS falk_kvot(user_id INTEGER PRIMARY KEY, plan TEXT NOT NULL, start INTEGER NOT NULL, tokens INTEGER NOT NULL DEFAULT 0, sokfragor INTEGER NOT NULL DEFAULT 0)');
+  db.exec('CREATE TABLE IF NOT EXISTS falk_dag(dag TEXT PRIMARY KEY, tokens INTEGER NOT NULL DEFAULT 0)');
+  const dagNu = () => new Date(now()).toISOString().slice(0, 10);
+  function kvotRad(u, planNamn) {
+    const k = KVOT[planNamn];
+    let r = q('SELECT * FROM falk_kvot WHERE user_id=?').get(u.id);
+    if (!r || r.plan !== planNamn || now() - r.start >= k.period) {
+      r = { user_id: u.id, plan: planNamn, start: now(), tokens: 0, sokfragor: 0 };
+      q('INSERT INTO falk_kvot(user_id,plan,start,tokens,sokfragor) VALUES(?,?,?,0,0) ON CONFLICT(user_id) DO UPDATE SET plan=excluded.plan, start=excluded.start, tokens=0, sokfragor=0').run(u.id, planNamn, r.start);
+    }
+    return r;
+  }
+  function kvotUt(r) {
+    const k = KVOT[r.plan];
+    return { plan: r.plan, anvant: Math.min(r.tokens, k.tokens), tak: k.tokens, kvar: Math.max(0, k.tokens - r.tokens),
+      sokKvar: k.sokfragor === Infinity ? null : Math.max(0, k.sokfragor - r.sokfragor), fyllsPa: r.start + k.period };
+  }
+  const dagTokens = () => q('SELECT tokens FROM falk_dag WHERE dag=?').get(dagNu())?.tokens || 0;
+  function raknaTokens(r, n) {
+    n = Math.max(0, Math.round(n)); if (!n) return;
+    r.tokens += n;
+    q('UPDATE falk_kvot SET tokens=tokens+? WHERE user_id=?').run(n, r.user_id);
+    q('INSERT INTO falk_dag(dag,tokens) VALUES(?,?) ON CONFLICT(dag) DO UPDATE SET tokens=tokens+excluded.tokens').run(dagNu(), n);
+    q('DELETE FROM falk_dag WHERE dag<?').run(new Date(now() - 30 * DAG).toISOString().slice(0, 10));
+  }
+  const uppskatta = (msgs) => Math.ceil(msgs.reduce((a, m) => a + String(m.content || '').length + (m.tool_calls ? JSON.stringify(m.tool_calls).length : 0), 0) / 3);
+  const pagar = new Set();   // en fråga i taget per konto
 
   for (const [kol, typ] of [['stripe_customer', 'TEXT'], ['pro_sub', 'TEXT'], ['pro_until', 'INTEGER']]) {
     if (!q(`SELECT 1 FROM pragma_table_info('users') WHERE name='${kol}'`).get()) db.exec(`ALTER TABLE users ADD COLUMN ${kol} ${typ}`);
@@ -168,33 +206,55 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
     return { until: s.current_period_end * 1000 };
   });
 
-  // Falk: AI-assistenten, bara för Pro
+  // Falk: AI-assistenten. Gratis med liten kvot och mindre modell, Pro med stor kvot.
+  rutt('GET', '/falk/kvot', async (req) => {
+    const u = await uppdatera(kravInloggad(req));
+    return { kvot: kvotUt(kvotRad(u, arPro(u) ? 'pro' : 'gratis')) };
+  });
   rutt.max('/falk/chat', 1_400_000);   // bifogade filer/mappar och projektfiler (klienten håller sig under ~60k + 100k tecken)
   rutt('POST', '/falk/chat', async (req, res, b) => {
     const u = await uppdatera(kravInloggad(req));
-    if (!arPro(u)) throw Object.assign(fel(402, 'Falk ingår i AdRaze Pro.'), { kropp: { ok: false, error: 'no_pro', message: 'Falk ingår i AdRaze Pro.' } });
     if (!AI_BASE || !AI_KEY) throw fel(503, 'Falk är inte igång just nu.');
-    if (begransad(`falk:${u.id}`, AI_PER_DYGN, 86_400_000)) throw fel(429, 'Du har ställt väldigt många frågor i dag. Försök igen i morgon.');
+    if (pagar.has(u.id)) throw fel(429, 'Falk svarar redan på en fråga. Vänta tills den är klar.');
+    pagar.add(u.id);
+    try { return await falkSvar(u, b); } finally { pagar.delete(u.id); }
+  });
+  async function falkSvar(u, b) {
+    const planNamn = arPro(u) ? 'pro' : 'gratis', k = KVOT[planNamn], modell = k.modell();
+    const kv = kvotRad(u, planNamn);
+    const kvotFel = () => Object.assign(fel(429, 'kvot'), { kropp: { ok: false, error: 'kvot_slut', kvot: kvotUt(kv),
+      message: planNamn === 'pro' ? 'Du har använt hela din Falk-kvot för den här perioden. Den fylls på ' + new Date(kv.start + k.period).toLocaleDateString('sv-SE') + '.'
+        : 'Du har använt gratiskvoten för Falk. Den fylls på ' + new Date(kv.start + k.period).toLocaleDateString('sv-SE') + ', eller skaffa Pro för mycket mer.' } });
+    if (kv.tokens >= k.tokens) throw kvotFel();
+    if (dagTokens() >= DAG_TAK) { console.error('Falk: dygnstaket nått', dagTokens()); throw fel(503, 'Falk har väldigt mycket att göra just nu. Försök igen senare.'); }
+    if (begransad('falk:alla', MINUT_TAK, 60_000)) throw fel(503, 'Falk har väldigt mycket att göra just nu. Försök igen om en minut.');
+    if (begransad(`falk:${u.id}`, k.perDygn, DAG)) throw fel(429, 'Du har ställt väldigt många frågor i dag. Försök igen i morgon.');
     const msgs = (Array.isArray(b.messages) ? b.messages : []).slice(-16)
       .filter((m) => m && ['user', 'assistant', 'system'].includes(m.role) && typeof m.content === 'string')
       .map((m) => ({ role: m.role, content: m.content.slice(0, 120_000) }));
     if (!msgs.length) throw fel(400, 'Skriv en fråga.');
     // Totalt tak: blir det för mycket kortas de äldsta meddelandena först (instruktionerna först i listan och din senaste fråga behålls)
     let tot = msgs.reduce((a, m) => a + m.content.length, 0);
-    for (let i = 2; tot > 280_000 && i < msgs.length - 1; i++) { tot -= msgs[i].content.length; msgs[i].content = msgs[i].content.slice(0, 2000) + '\n…(äldre meddelande kortat)'; tot += msgs[i].content.length; }
+    for (let i = 2; tot > k.maxTecken && i < msgs.length - 1; i++) { tot -= msgs[i].content.length; msgs[i].content = msgs[i].content.slice(0, 2000) + '\n…(äldre meddelande kortat)'; tot += msgs[i].content.length; }
+    for (let i = 0; tot > k.maxTecken && i < msgs.length; i++) { const over = tot - k.maxTecken; if (msgs[i].content.length > 4000) { const ny = Math.max(2000, msgs[i].content.length - over); tot -= msgs[i].content.length - ny; msgs[i].content = msgs[i].content.slice(0, ny) + '\n…(kortat)'; } }
     msgs.splice(msgs[0].role === 'system' ? 1 : 0, 0, { role: 'system', content: webbInstruktion() + (b.flik ? FLIK_INSTRUKTION : '') });
     const verktyg = b.flik ? WEBB_VERKTYG.concat(FLIK_VERKTYG) : WEBB_VERKTYG;
+    let uppgradera = null, sokRaknad = false;
     // Falk får söka och läsa sidor själv; klienten väntar 70 s, så allt måste vara klart långt innan
     const slut = Date.now() + 55_000, kallor = [], traffar = [];
     let sokningar = 0, lasta = 0, svar = null;
     for (let varv = 0; varv < 6 && !svar; varv++) {
-      const sista = varv === 5 || slut - Date.now() < 15_000;
+      // Räcker inte kvoten till ett varv till med verktyg: svara nu med det som finns
+      const sista = varv === 5 || slut - Date.now() < 15_000 || (varv > 0 && kv.tokens + uppskatta(msgs) + k.maxSvar > k.tokens);
+      if (varv > 0 && kv.tokens >= k.tokens) break;
       const r = await fetch(AI_BASE, {
         method: 'POST', signal: AbortSignal.timeout(Math.max(5_000, Math.min(45_000, slut - Date.now()))),
         headers: { authorization: `Bearer ${AI_KEY}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ model: AI_MODEL, messages: msgs, max_tokens: 4000, temperature: 0.4, reasoning_effort: 'none', tools: verktyg, tool_choice: sista ? 'none' : 'auto' }),
+        body: JSON.stringify({ model: modell, messages: msgs, max_tokens: k.maxSvar, temperature: 0.4, reasoning_effort: 'none', tools: verktyg, tool_choice: sista ? 'none' : 'auto' }),
       }).catch(() => null);
       const d = r ? await r.json().catch(() => ({})) : {};
+      // Räkna det som faktiskt användes (saknas siffran: uppskatta från texten)
+      raknaTokens(kv, Number(d.usage?.total_tokens) || (r?.ok ? uppskatta(msgs) + Math.ceil(String(d.choices?.[0]?.message?.content || '').length / 3) : 0));
       const m = d.choices?.[0]?.message;
       if (!r?.ok || !m) { console.error('Falk', r?.status, d.error?.message); break; }
       // Ibland skickar leverantören DeepSeeks råa verktygssyntax som text i stället för tool_calls
@@ -210,20 +270,25 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
       const flikAnrop = b.flik ? anrop.filter((a) => FLIK_NAMN.has(a.function?.name)) : [];
       if (flikAnrop.length) {
         const actions = flikAnrop.slice(0, 3).map((a) => { let arg = {}; try { arg = JSON.parse(a.function.arguments || '{}'); } catch {} return flikHandling(a.function.name, arg); }).filter(Boolean);
-        return { reply: (m.content || '').trim(), actions, sources: [] };
+        return { reply: (m.content || '').trim(), actions, sources: [], kvot: kvotUt(kv) };
       }
       msgs.push({ role: 'assistant', content: m.content || '', tool_calls: anrop });
       const utfall = await Promise.all(anrop.map(async (a) => {
         let arg = {}; try { arg = JSON.parse(a.function?.arguments || '{}'); } catch {}
         try {
+          const webbVerktyg = a.function?.name === 'web_search' || a.function?.name === 'read_page';
+          if (webbVerktyg && !sokRaknad) {
+            if (kv.sokfragor >= k.sokfragor) { uppgradera = 'sok'; return 'Webbsökning ingår inte längre i användarens gratiskvot för den här perioden. Sök inte mer. Svara med det du vet och nämn kort att Falk Pro kan söka på webben.'; }
+            sokRaknad = true; kv.sokfragor++; q('UPDATE falk_kvot SET sokfragor=sokfragor+1 WHERE user_id=?').run(kv.user_id);
+          }
           if (a.function?.name === 'web_search' && arg.query) {
-            if (++sokningar > 8) return 'Sökgränsen för den här frågan är nådd. Svara med det du har.';
+            if (++sokningar > k.sokPerFraga) return 'Sökgränsen för den här frågan är nådd. Svara med det du har.';
             const t = await webb.sok(arg.query);
             traffar.push(...t);
             return t.length ? JSON.stringify(t) : 'Inga träffar. Prova andra sökord (t.ex. på engelska).';
           }
           if (a.function?.name === 'read_page' && arg.url) {
-            if (++lasta > 6) return 'Gränsen för antal lästa sidor är nådd. Svara med det du har.';
+            if (++lasta > k.lasPerFraga) return 'Gränsen för antal lästa sidor är nådd. Svara med det du har.';
             const s = await webb.lasSida(arg.url);
             kallor.push({ titel: s.titel || new URL(s.url).hostname, url: s.url });
             return `URL: ${s.url}\nTitel: ${s.titel}\n\n${s.text || '(sidan saknar läsbar text, den laddas troligen med JavaScript)'}`;
@@ -235,14 +300,15 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
     }
     // Ta bort inledande "Nu har jag tillräckligt … Låt mig sammanställa"-stycken
     if (svar) svar = svar.replace(/^(?:(?:Nu har jag|Jag har (?:nu )?(?:tillräckligt|bra|all)|Låt mig|Perfekt|Bra[,!])[^\n]*\n+)+/i, '').trim() || svar;
+    if (!svar && kv.tokens >= k.tokens) throw kvotFel();
     if (!svar) throw fel(502, 'Falk kunde inte svara just nu. Försök igen om en stund.');
     // Källor: lästa sidor först, sedan sökträffar vars webbplats nämns i svaret
     const lagt = new Set(), sources = [];
     const lagg = (k) => { const h = k.url.replace(/[#?].*$/, ''); if (lagt.has(h) || sources.length >= 6) return; lagt.add(h); sources.push({ title: k.titel, url: k.url }); };
     kallor.forEach(lagg);
     for (const t of traffar) { try { const host = new URL(t.url).hostname.replace(/^www\./, ''); if (svar.toLowerCase().includes(host.toLowerCase()) || svar.includes(t.url)) lagg(t); } catch {} }
-    return { reply: svar, sources };
-  });
+    return { reply: svar, sources, kvot: kvotUt(kv), ...(uppgradera ? { uppgradera } : {}) };
+  }
 
   function dsmlAnrop(text) {
     const t = String(text || '');
