@@ -73,7 +73,8 @@ CREATE TABLE IF NOT EXISTS barn_godkann(barn_id TEXT PRIMARY KEY REFERENCES barn
   tries INTEGER NOT NULL DEFAULT 0, expires INTEGER NOT NULL, sent_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS barn_fragor(id INTEGER PRIMARY KEY, barn_id TEXT NOT NULL REFERENCES barn(id) ON DELETE CASCADE,
   host TEXT NOT NULL, text TEXT, skapad INTEGER NOT NULL, svar TEXT, minuter INTEGER, svarad INTEGER);
-CREATE INDEX IF NOT EXISTS barn_fragor_barn ON barn_fragor(barn_id, skapad);`);
+CREATE INDEX IF NOT EXISTS barn_fragor_barn ON barn_fragor(barn_id, skapad);
+CREATE TABLE IF NOT EXISTS barn_enheter(token TEXT PRIMARY KEY, barn_id TEXT NOT NULL REFERENCES barn(id) ON DELETE CASCADE, skapad INTEGER NOT NULL);`);
 
 // ---------- hjälpare ----------
 const now = () => Date.now();
@@ -652,6 +653,33 @@ rutt('POST', '/barn/jag', (req) => {
   const c = barnInloggad(req);
   return { namn: c.namn, alder: c.alder, blocklista: lasLista(c.blocklista), tillat: aktivaTillat(c.tillat),
     fragor: q('SELECT id, host, skapad, svar, minuter, svarad FROM barn_fragor WHERE barn_id=? AND skapad>? ORDER BY skapad DESC LIMIT 20').all(c.id, now() - 86_400_000) };
+});
+// Barnets dator får en egen märkning som finns kvar när barnet loggar ut. Loggar någon sedan in med ett ANNAT
+// vuxenkonto än förälderns på den datorn (barnspärren släpper då) får föräldern ett mejl – barnet låses inte ute.
+rutt('POST', '/barn/enhet', (req) => {
+  const c = barnInloggad(req);
+  const t = crypto.randomBytes(32).toString('base64url');
+  q('INSERT INTO barn_enheter(token,barn_id,skapad) VALUES(?,?,?)').run(sha(t), c.id, now());
+  q('DELETE FROM barn_enheter WHERE barn_id=? AND token NOT IN (SELECT token FROM barn_enheter WHERE barn_id=? ORDER BY skapad DESC LIMIT 20)').run(c.id, c.id);
+  return { enhet: t };
+});
+rutt('POST', '/barn/annat-konto', async (req, res, b) => {
+  const e = q('SELECT b.id, b.namn, b.foralder_id, u.email AS foralder_epost FROM barn_enheter e JOIN barn b ON b.id=e.barn_id JOIN users u ON u.id=b.foralder_id WHERE e.token=?').get(sha(String(b.enhet || '')));
+  if (!e) return { kand: false };                       // okänd/borttagen märkning: datorn hör inte till någon familj längre
+  const vuxen = inloggad(req);
+  if (vuxen && vuxen.id === e.foralder_id) return { kand: true, foralder: true };   // föräldern själv låser upp: inget mejl
+  const vem = vuxen ? vuxen.email : String(b.epost || '').slice(0, 200);
+  if (begransad(`annatkonto:${e.id}:${vem}`, 1, 6 * 3_600_000) || begransad(`annatkonto:${e.id}`, 5, 86_400_000)) return { kand: true, foralder: false };
+  const tid = new Date().toLocaleString('sv-SE', { timeZone: 'Europe/Stockholm', dateStyle: 'long', timeStyle: 'short' });
+  const namn = e.namn;
+  await skickaMejl(e.foralder_epost, `${namn} loggade in med ett annat konto i AdRaze`,
+    mejlLayout(`${namn} loggade in med ett annat konto`,
+      mejlText(`På ${esc(namn)}s dator loggade någon in i AdRaze med kontot <b>${esc(vem || 'okänt konto')}</b> (${esc(tid)}).`) +
+      mejlText(`Med ett annat konto gäller inte ${esc(namn)}s spärrar. Var det inte okej kan ni prata om det, och du kan byta ${esc(namn)}s kod i AdRaze under Inställningar › Familj.`) +
+      mejlRuta(`Var det du eller någon annan vuxen i familjen? Då behöver du inte göra något.`)),
+    `På ${namn}s dator loggade någon in i AdRaze med kontot ${vem || 'okänt konto'} (${tid}). Med ett annat konto gäller inte ${namn}s spärrar. Du kan byta ${namn}s kod i AdRaze under Inställningar › Familj.`,
+    undefined, 'drift');
+  return { kand: true, foralder: false };
 });
 // Barnet frågar om lov att gå in på en spärrad sida. Föräldern ser frågan i AdRaze Familj.
 const fragaHost = (h) => String(h || '').trim().toLowerCase().replace(/^www\./, '').replace(/\.$/, '').slice(0, 200);
