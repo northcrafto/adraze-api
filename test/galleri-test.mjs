@@ -63,22 +63,23 @@ let r;
 
 console.log('Schema');
 r = await api(null, 'GET', '/galleri/schema');
-koll('schema utan inloggning', r.s === 200 && r.j.val['tema.lage'].includes('mork') && r.j.namnMax === 40 && r.j.beskMax === 140 && r.j.perDygn === 5, r.j);
+koll('schema utan inloggning: tema-områdets nycklar och val', r.s === 200 && r.j.farger.join() === 'tema.accent' && r.j.val['tema.lage'].join() === 'ljust,morkt,system' && r.j.val['tema.horn'].join() === 'kantig,normal,rund' && r.j.val['tema.densitet'].join() === 'kompakt,normal,luftig' && r.j.namnMax === 40 && r.j.beskMax === 140 && r.j.perDygn === 5, r.j);
+koll('typsnitt och textstorlek delas inte (personliga val)', !('tema.typsnitt' in r.j.val) && !('tema.storlek' in r.j.val) && !r.j.farger.includes('tema.typsnitt'), r.j);
 
 console.log('Publicera');
-const midnatt = { 'tema.accent': '#FF4B1F', 'tema.bakgrund': '#0e2a47', 'tema.lage': 'mork' };
+const midnatt = { 'tema.accent': '#FF4B1F', 'tema.horn': 'rund', 'tema.lage': 'morkt' };
 r = await publicera(null, 'Midnatt', midnatt); koll('utan inloggning → 401', r.s === 401, r);
 r = await publicera(K, 'Midnatt', midnatt); koll('barnkonto kan inte publicera → 401', r.s === 401, r);
 r = await publicera(A, 'Midnatt', midnatt, { beskrivning: 'Mörkblått med orange.' });
 koll('vuxen publicerar', r.s === 200 && /^t[0-9a-f]{20}$/.test(r.j.tema.id) && r.j.kvarIdag === 4, r);
 const M = r.j.tema;
-koll('färger normaliseras (#FF4B1F → #ff4b1f)', M.varden['tema.accent'] === '#ff4b1f' && M.varden['tema.lage'] === 'mork', M.varden);
+koll('färger normaliseras (#FF4B1F → #ff4b1f)', M.varden['tema.accent'] === '#ff4b1f' && M.varden['tema.lage'] === 'morkt', M.varden);
 koll('skaparen = användarnamnet i chatten', M.skapare === 'Anna_A' && M.egen === true, M);
 r = await publicera(B, 'x'.repeat(41), { 'tema.accent': farg() }); koll('namn över 40 tecken → 400', r.s === 400 && /40/.test(r.j.error), r);
 r = await publicera(B, 'Fyrtio', { 'tema.accent': farg() }, { beskrivning: 'y'.repeat(141) }); koll('beskrivning över 140 tecken → 400', r.s === 400 && /140/.test(r.j.error), r);
 r = await publicera(B, 'å'.repeat(40), { 'tema.accent': farg() }, { beskrivning: 'ö'.repeat(140) }); koll('exakt 40 + 140 tecken (åäö) går', r.s === 200, r);
 r = await publicera(B, 'https://evil.example/', { 'tema.accent': farg() }); koll('namn som bara är en länk → 400', r.s === 400, r);
-r = await publicera(A, '<b>Skog</b> https://evil.example/x', { 'tema.accent': '#2f9e67', 'tema.yta': '#eef3f9' },
+r = await publicera(A, '<b>Skog</b> https://evil.example/x', { 'tema.accent': '#2f9e67', 'tema.densitet': 'luftig' },
   { beskrivning: 'Besök evil.com/x eller discord.gg/abc, mejla mig@test.se, www.spam.se och <script>alert(1)</script> nu' });
 koll('HTML och länkar rensas ur namnet', r.s === 200 && r.j.tema.namn === 'Skog', r.j && r.j.tema);
 koll('länkar, domäner och mejl rensas ur beskrivningen', r.s === 200 && r.j.tema.beskrivning === 'Besök eller mejla och alert(1) nu', r.j && r.j.tema && r.j.tema.beskrivning);
@@ -98,6 +99,12 @@ const ogiltiga = [
   ['bildadress', kod({ 'tema.bild': 'https://evil.example/a.png' })],
   ['CSS-text', kod({ 'tema.css': 'body{display:none}' })],
   ['okänt val', kod({ 'tema.lage': 'neon' })],
+  ['gammalt värde (mork i stället för morkt)', kod({ 'tema.lage': 'mork' })],
+  ['färg på en nyckel som inte är en färg', kod({ 'tema.bakgrund': '#ffffff' })],
+  ['typsnitt (personligt val)', kod({ 'tema.accent': '#ffffff', 'tema.typsnitt': 'mono' })],
+  ['textstorlek (personligt val)', kod({ 'tema.storlek': 'stor' })],
+  ['sant/falskt', kod({ 'tema.accent': '#ffffff', 'tema.glas': true })],
+  ['hex med genomskinlighet', kod({ 'tema.accent': '#ff4b1f80' })],
   ['tal', kod({ 'tema.accent': 5 })],
   ['objekt som värde', kod({ 'tema.accent': { a: 1 } })],
   ['__proto__-nyckel', kod('{"__proto__":"#ffffff"}')],
@@ -108,10 +115,10 @@ const ogiltiga = [
   ['för stor kod', 'ADRZ1.' + 'A'.repeat(9000)],
 ];
 for (const [namn, k] of ogiltiga) { r = await publicera(C, 'Testtema', k); koll('avvisas: ' + namn, r.s === 400, r); }
-r = await publicera(C, 'Glas', { 'tema.glas': true, 'tema.yta': '#ABC', 'tema.rundning': 'rund' });
-koll('sant/falskt, kort hex och kända val godtas', r.s === 200 && r.j.tema.varden['tema.glas'] === true && r.j.tema.varden['tema.yta'] === '#aabbcc' && r.j.tema.varden['tema.rundning'] === 'rund', r.j);
+r = await publicera(C, 'Glas', { 'tema.accent': '#ABC', 'tema.horn': 'kantig', 'tema.densitet': 'kompakt', 'tema.lage': 'system' });
+koll('kort hex normaliseras och alla kända val godtas', r.s === 200 && JSON.stringify(r.j.tema.varden) === JSON.stringify({ 'tema.accent': '#aabbcc', 'tema.densitet': 'kompakt', 'tema.horn': 'kantig', 'tema.lage': 'system' }), r.j);
 const GLAS = r.j && r.j.tema.id;
-r = await publicera(B, 'Kopia', { 'tema.lage': 'mork', 'tema.bakgrund': '#0E2A47', 'tema.accent': '#ff4b1f' }); koll('likadant tema som redan finns → 409', r.s === 409 && r.j.error.includes('Midnatt'), r);
+r = await publicera(B, 'Kopia', { 'tema.lage': 'morkt', 'tema.horn': 'rund', 'tema.accent': '#FF4B1F' }); koll('likadant tema som redan finns → 409', r.s === 409 && r.j.error.includes('Midnatt'), r);
 r = await api(A, 'GET', '/galleri/mina'); koll('mina: två teman, tre kvar i dag', r.s === 200 && r.j.teman.length === 2 && r.j.kvarIdag === 3, r.j);
 r = await api(K, 'GET', '/galleri/mina'); koll('barn har inga egna teman → 401', r.s === 401, r);
 
@@ -192,7 +199,7 @@ r = await publicera(A, 'Fem', { 'tema.accent': farg() }); koll('femte', r.s === 
 r = await publicera(A, 'Sex', { 'tema.accent': farg() }); koll('sjätte samma dygn → 429 (borttagna räknas)', r.s === 429, r);
 
 console.log('Sidvis');
-for (let i = 0; i < 6; i++) { const E = vuxen(`e${i}@test.se`); for (let j = 0; j < 5; j++) await publicera(E, `Tema ${i}-${j}`, { 'tema.accent': farg(), 'tema.bakgrund': farg() }); }
+for (let i = 0; i < 6; i++) { const E = vuxen(`e${i}@test.se`); for (let j = 0; j < 5; j++) await publicera(E, `Tema ${i}-${j}`, { 'tema.accent': farg() }); }
 r = await lista(null, 'nya', 0); const s0 = ids(r);
 koll('första sidan: 24 och fler finns', s0.length === 24 && r.j.mer === true, { n: s0.length, mer: r.j.mer });
 r = await lista(null, 'nya', 1); const s1 = ids(r);

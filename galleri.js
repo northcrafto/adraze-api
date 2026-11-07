@@ -2,8 +2,8 @@
 // Kopplas in i server.js med require('./galleri.js')({ ... }) EFTER chatt.js: skaparens namn är användarnamnet
 // i chatten. Har man inget, eller väljer att publicera anonymt, visas skaparen som "Anonym" (null här).
 //
-// Ett tema är en ADRZ1-kod (samma format som AdRazes delningskod) som BARA får innehålla tema.*-nycklar.
-// Värdena får vara hex-färger, sant/falskt eller ett av de kända valen i TEMA_VAL. Allt annat avvisas
+// Ett tema är en ADRZ1-kod (samma format som AdRazes delningskod) som BARA får innehålla tema-områdets
+// utseendeval: accentfärgen (hex) och de kända valen i TEMA_VAL. Allt annat avvisar hela koden
 // (bilder, adresser, CSS, fritext, tal, andra områden), så ett delat tema kan aldrig bära något annat än utseende.
 //
 // Rutter (svarar som resten av API:t: { ok:true, ... } eller { ok:false, error:'svensk text' }):
@@ -30,19 +30,17 @@ module.exports = function registreraGalleri({ rutt, q, db, fel, inloggad, kravIn
   const VECKA = 7 * 86_400_000;
   const ORSAKER = ['olampligt', 'spam', 'annat'];
 
-  // Nycklar: tema.<namn>, en nivå, bara bokstäver och siffror. Färger godtas för alla sådana nycklar.
+  // Det som får delas är exakt tema-områdets utseendeval i webbläsaren (browser/anpassa-tema.js, ui/anpassa-tema.js).
+  // Typsnitt och textstorlek (tema.typsnitt, tema.storlek) är personliga val: som i tema-områdets färdiga teman
+  // delas de inte och ändras aldrig av ett tema från galleriet (ingen ska få mindre text av någon annans tema).
+  // Får tema-området nya utseendeval läggs de till här; klienten läser listan via /galleri/schema.
   const NYCKEL_RE = /^tema\.[a-z][a-zA-Z0-9]{0,39}$/;
-  const HEX_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
-  // Kända val (enum) per nyckel. Lägg till här när tema-området i webbläsaren får nya val.
-  const TEMA_VAL = {
-    'tema.lage': ['ljus', 'ljust', 'mork', 'morkt', 'system', 'light', 'dark', 'auto'],
-    'tema.rundning': ['ingen', 'skarp', 'liten', 'mjuk', 'mellan', 'rund', 'stor'],
+  const HEX_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
+  const FARGER = ['tema.accent'];                    // hex-färger (#rgb eller #rrggbb, sparas som #rrggbb)
+  const TEMA_VAL = {                                 // kända val per nyckel
+    'tema.lage': ['ljust', 'morkt', 'system'],
     'tema.densitet': ['kompakt', 'normal', 'luftig'],
-    'tema.typsnitt': ['system', 'sans', 'rundad', 'serif', 'mono'],
-    'tema.kontrast': ['normal', 'hog'],
-    'tema.flikform': ['rund', 'fyrkantig', 'flik', 'linje'],
-    'tema.ikoner': ['linje', 'fylld'],
-    'tema.skuggor': ['inga', 'mjuka', 'tydliga'],
+    'tema.horn': ['kantig', 'normal', 'rund'],
   };
 
   // ---------- tabeller ----------
@@ -119,10 +117,9 @@ module.exports = function registreraGalleri({ rutt, q, db, fel, inloggad, kravIn
   // ---------- validering ----------
   const normHex = (h) => { h = h.toLowerCase(); return h.length === 4 ? `#${h[1]}${h[1]}${h[2]}${h[2]}${h[3]}${h[3]}` : h; };
   function giltigtVarde(k, v) {
-    if (typeof k !== 'string' || !NYCKEL_RE.test(k)) return undefined;
-    if (typeof v === 'string' && HEX_RE.test(v)) return normHex(v);
-    if (typeof v === 'boolean') return v;
-    if (typeof v === 'string' && Object.hasOwn(TEMA_VAL, k) && TEMA_VAL[k].includes(v)) return v;
+    if (typeof k !== 'string' || typeof v !== 'string') return undefined;
+    if (FARGER.includes(k)) return HEX_RE.test(v) ? normHex(v) : undefined;
+    if (Object.hasOwn(TEMA_VAL, k) && TEMA_VAL[k].includes(v)) return v;
     return undefined;
   }
   // ADRZ1-kod → validerade värden (sorterade). Allt som inte är ett tema avvisar HELA koden.
@@ -199,7 +196,7 @@ module.exports = function registreraGalleri({ rutt, q, db, fel, inloggad, kravIn
   }
 
   // ---------- rutter ----------
-  rutt('GET', '/galleri/schema', () => ({ nyckel: NYCKEL_RE.source, val: TEMA_VAL, maxNycklar: NYCKLAR_MAX, namnMax: NAMN_MAX, beskMax: BESK_MAX, perDygn: PUBL_PER_DYGN }));
+  rutt('GET', '/galleri/schema', () => ({ nyckel: NYCKEL_RE.source, farger: FARGER, val: TEMA_VAL, maxNycklar: NYCKLAR_MAX, namnMax: NAMN_MAX, beskMax: BESK_MAX, perDygn: PUBL_PER_DYGN }));
 
   rutt('GET', '/galleri/lista', (req) => {
     if (begransad(`gallerilista:${ipAv(req)}`, 900, 3_600_000)) throw fel(429, 'För många förfrågningar. Vänta en stund.');
