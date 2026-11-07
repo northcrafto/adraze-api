@@ -70,7 +70,10 @@ CREATE TABLE IF NOT EXISTS barn_sessioner(token TEXT PRIMARY KEY, barn_id TEXT N
 CREATE TABLE IF NOT EXISTS barn_historik(barn_id TEXT NOT NULL REFERENCES barn(id) ON DELETE CASCADE, url TEXT NOT NULL, titel TEXT, ts INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS barn_historik_ts ON barn_historik(barn_id, ts);
 CREATE TABLE IF NOT EXISTS barn_godkann(barn_id TEXT PRIMARY KEY REFERENCES barn(id) ON DELETE CASCADE, hash TEXT NOT NULL,
-  tries INTEGER NOT NULL DEFAULT 0, expires INTEGER NOT NULL, sent_at INTEGER NOT NULL);`);
+  tries INTEGER NOT NULL DEFAULT 0, expires INTEGER NOT NULL, sent_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS barn_fragor(id INTEGER PRIMARY KEY, barn_id TEXT NOT NULL REFERENCES barn(id) ON DELETE CASCADE,
+  host TEXT NOT NULL, text TEXT, skapad INTEGER NOT NULL, svar TEXT, minuter INTEGER, svarad INTEGER);
+CREATE INDEX IF NOT EXISTS barn_fragor_barn ON barn_fragor(barn_id, skapad);`);
 
 // ---------- hjälpare ----------
 const now = () => Date.now();
@@ -647,7 +650,23 @@ rutt('POST', '/barn/verifiera', async (req, res, b) => {
 
 rutt('POST', '/barn/jag', (req) => {
   const c = barnInloggad(req);
-  return { namn: c.namn, alder: c.alder, blocklista: lasLista(c.blocklista), tillat: aktivaTillat(c.tillat) };
+  return { namn: c.namn, alder: c.alder, blocklista: lasLista(c.blocklista), tillat: aktivaTillat(c.tillat),
+    fragor: q('SELECT id, host, skapad, svar, minuter, svarad FROM barn_fragor WHERE barn_id=? AND skapad>? ORDER BY skapad DESC LIMIT 20').all(c.id, now() - 86_400_000) };
+});
+// Barnet frågar om lov att gå in på en spärrad sida. Föräldern ser frågan i AdRaze Familj.
+const fragaHost = (h) => String(h || '').trim().toLowerCase().replace(/^www\./, '').replace(/\.$/, '').slice(0, 200);
+rutt('POST', '/barn/fraga', (req, res, b) => {
+  const c = barnInloggad(req);
+  const host = fragaHost(b.host);
+  if (!host || !/^[a-z0-9.-]+$/.test(host)) throw fel(400, 'Ogiltig sida.');
+  const text = String(b.text || '').replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, 200) || null;
+  if (begransad(`barnfraga:${c.id}`, 20, 3_600_000)) throw fel(429, 'Du har frågat många gånger nu. Vänta en stund.');
+  const vant = q('SELECT id FROM barn_fragor WHERE barn_id=? AND host=? AND svar IS NULL').get(c.id, host);
+  let id;
+  if (vant) { q('UPDATE barn_fragor SET text=?, skapad=? WHERE id=?').run(text, now(), vant.id); id = vant.id; }
+  else id = Number(q('INSERT INTO barn_fragor(barn_id,host,text,skapad) VALUES(?,?,?,?)').run(c.id, host, text, now()).lastInsertRowid);
+  q('DELETE FROM barn_fragor WHERE barn_id=? AND id NOT IN (SELECT id FROM barn_fragor WHERE barn_id=? ORDER BY skapad DESC LIMIT 50)').run(c.id, c.id);
+  return { id };
 });
 rutt('POST', '/barn/historik', (req, res, b) => {
   const c = barnInloggad(req);
@@ -679,7 +698,25 @@ rutt('POST', '/familj/lista', (req) => {
   const antal = q('SELECT COUNT(*) AS n FROM barn_sessioner WHERE barn_id=? AND expires>?');
   return { barn: q('SELECT * FROM barn WHERE foralder_id=? ORDER BY skapad').all(u.id).map((c) => ({
     id: c.id, namn: c.namn, alder: c.alder, kod: c.kod, blocklista: lasLista(c.blocklista), tillat: aktivaTillat(c.tillat),
-    senast: c.senast || 0, inloggningar: antal.get(c.id, now()).n })) };
+    senast: c.senast || 0, inloggningar: antal.get(c.id, now()).n,
+    fragor: q('SELECT id, host, text, skapad FROM barn_fragor WHERE barn_id=? AND svar IS NULL AND skapad>? ORDER BY skapad DESC LIMIT 20').all(c.id, now() - 7 * 86_400_000) })) };
+});
+// Föräldern svarar på barnets fråga: ja (i X minuter, eller 0 = alltid) eller nej
+rutt('POST', '/familj/svara', (req, res, b) => {
+  const u = kravInloggad(req);
+  const f = q('SELECT f.*, b.foralder_id, b.tillat, b.blocklista FROM barn_fragor f JOIN barn b ON b.id=f.barn_id WHERE f.id=?').get(parseInt(b.fraga_id, 10) || 0);
+  if (!f || f.foralder_id !== u.id) throw fel(404, 'Frågan finns inte.');
+  const ja = b.svar === 'ja', min = parseInt(b.minuter, 10);
+  if (ja && !(min >= 0 && min <= 100_000)) throw fel(400, 'Ogiltig tid.');
+  if (ja && min > 0) {
+    const lista = aktivaTillat(f.tillat).filter((a) => a.host !== f.host).concat({ host: f.host, until: now() + min * 60_000 });
+    q('UPDATE barn SET tillat=? WHERE id=?').run(JSON.stringify(lista), f.barn_id);
+  } else if (ja) {
+    const bort = (h) => h === f.host || f.host.endsWith('.' + h) || h.endsWith('.' + f.host);
+    q('UPDATE barn SET blocklista=? WHERE id=?').run(JSON.stringify(lasLista(f.blocklista).filter((h) => !bort(fragaHost(h)))), f.barn_id);
+  }
+  q('UPDATE barn_fragor SET svar=?, minuter=?, svarad=? WHERE id=?').run(ja ? 'ja' : 'nej', ja ? min : null, now(), f.id);
+  return { svar: ja ? 'ja' : 'nej' };
 });
 rutt('POST', '/familj/blocklista', (req, res, b) => {
   const c = ettBarn(kravInloggad(req), b.barn_id);
