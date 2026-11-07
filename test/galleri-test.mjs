@@ -167,6 +167,8 @@ r = await lista(K, 'nya'); koll('barnet ser inte ett anmält tema', !ids(r).incl
 r = await lista(null, 'nya', 0, true); koll('barn=1 (barnläge utan barnkonto) döljer också', !ids(r).includes(GLAS), r.j.teman.map((t) => t.namn));
 r = await api(K, 'GET', '/galleri/tema?id=' + GLAS); koll('barnet kan inte hämta det anmälda temat', r.s === 404, r);
 r = await lista(A, 'nya'); koll('vuxna ser det fortfarande (en anmälan)', ids(r).includes(GLAS), r.j.teman.map((t) => t.namn));
+r = await lista(B, 'nya'); koll('men inte den som anmälde det', !ids(r).includes(GLAS) && ids(r).includes(M.id), r.j.teman.map((t) => t.namn));
+{ const bVecka = ids(await lista(B, 'vecka')); r = await lista(A, 'vecka'); koll('inte heller i topplistan (där andra ser det)', !bVecka.includes(GLAS) && ids(r).includes(GLAS), { B: bVecka, A: ids(r) }); }
 await api(B, 'POST', '/galleri/anmal', { id: GLAS, orsak: 'olampligt' });
 r = await api(D, 'POST', '/galleri/anmal', { id: GLAS, orsak: 'spam' }); koll('D anmäler', r.s === 200, r);
 r = await lista(A, 'nya'); koll('två olika konton räcker inte för att dölja', ids(r).includes(GLAS), r.j.teman.map((t) => t.namn));

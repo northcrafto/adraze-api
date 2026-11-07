@@ -208,6 +208,9 @@ module.exports = function registreraGalleri({ rutt, q, db, fel, inloggad, kravIn
     const sida = Math.max(0, Math.min(MAX_SIDA, parseInt(p.get('sida'), 10) || 0));
     const barn = p.get('barn') === '1' || (vem && vem.typ === 'barn');
     const barnVillkor = barn ? ' AND t.anmalningar=0' : '';
+    // Den som har anmält ett tema ser det inte längre
+    const minaAnm = ' AND NOT EXISTS (SELECT 1 FROM galleri_anmalningar a WHERE a.tema_id=t.id AND a.vem=?)';
+    const nyckel = vem ? vem.nyckel : '';
     let rader;
     if (sort === 'vecka') {
       // Topplistan: poäng från röster och nedladdningar de senaste sju dagarna
@@ -216,12 +219,12 @@ module.exports = function registreraGalleri({ rutt, q, db, fel, inloggad, kravIn
           SELECT tema_id, SUM(p) AS poang FROM (
             SELECT tema_id, CASE rost WHEN 1 THEN 2 WHEN -1 THEN -2 ELSE 0 END AS p FROM galleri_roster WHERE ts>?
             UNION ALL SELECT tema_id, 1 AS p FROM galleri_nedladdningar WHERE ts>?) GROUP BY tema_id) v ON v.tema_id=t.id
-        WHERE t.status='synlig' AND v.poang>0${barnVillkor}
-        ORDER BY v.poang DESC, t.gillar DESC, t.skapad DESC LIMIT ? OFFSET ?`).all(vem ? vem.nyckel : '', fran, fran, PER_SIDA + 1, sida * PER_SIDA);
+        WHERE t.status='synlig' AND v.poang>0${barnVillkor}${minaAnm}
+        ORDER BY v.poang DESC, t.gillar DESC, t.skapad DESC, t.rowid DESC LIMIT ? OFFSET ?`).all(nyckel, fran, fran, nyckel, PER_SIDA + 1, sida * PER_SIDA);
     } else {
-      const ordning = sort === 'nya' ? 't.skapad DESC' : '(t.gillar * 2 + t.nedladdningar - t.ogillar * 2) DESC, t.gillar DESC, t.skapad DESC';
-      rader = q(`SELECT ${VAL()} FROM galleri_teman t WHERE t.status='synlig'${barnVillkor} ORDER BY ${ordning} LIMIT ? OFFSET ?`)
-        .all(vem ? vem.nyckel : '', PER_SIDA + 1, sida * PER_SIDA);
+      const ordning = sort === 'nya' ? 't.skapad DESC, t.rowid DESC' : '(t.gillar * 2 + t.nedladdningar - t.ogillar * 2) DESC, t.gillar DESC, t.skapad DESC, t.rowid DESC';
+      rader = q(`SELECT ${VAL()} FROM galleri_teman t WHERE t.status='synlig'${barnVillkor}${minaAnm} ORDER BY ${ordning} LIMIT ? OFFSET ?`)
+        .all(nyckel, nyckel, PER_SIDA + 1, sida * PER_SIDA);
     }
     const mer = rader.length > PER_SIDA;
     return { sort, sida, mer, teman: rader.slice(0, PER_SIDA).map((t, i) => utTema(t, vem, sort === 'vecka' ? { plats: sida * PER_SIDA + i + 1 } : undefined)) };
@@ -237,7 +240,7 @@ module.exports = function registreraGalleri({ rutt, q, db, fel, inloggad, kravIn
 
   rutt('GET', '/galleri/mina', (req) => {
     const u = kravInloggad(req), vem = { typ: 'vuxen', id: u.id, nyckel: 'u:' + u.id };
-    const rader = q(`SELECT ${VAL()} FROM galleri_teman t WHERE t.agare=? AND t.status IN ('synlig','dold') ORDER BY t.skapad DESC LIMIT ?`).all(vem.nyckel, u.id, AKTIVA_MAX);
+    const rader = q(`SELECT ${VAL()} FROM galleri_teman t WHERE t.agare=? AND t.status IN ('synlig','dold') ORDER BY t.skapad DESC, t.rowid DESC LIMIT ?`).all(vem.nyckel, u.id, AKTIVA_MAX);
     const idag = q('SELECT COUNT(*) AS n FROM galleri_teman WHERE agare=? AND skapad>?').get(u.id, now() - 86_400_000).n;
     return { teman: rader.map((t) => utTema(t, vem, { dold: t.status === 'dold' })), kvarIdag: Math.max(0, PUBL_PER_DYGN - idag) };
   });
