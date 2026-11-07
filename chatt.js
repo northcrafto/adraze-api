@@ -18,7 +18,7 @@ const _net = require('node:net');
 const _http = require('node:http');
 const _https = require('node:https');
 
-module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad, begransad, now, sha, ipAv, crypto = nodeCrypto }) {
+module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad: kravVuxen, barnInloggad, nyttKonto, begransad, now, sha, ipAv, crypto = nodeCrypto }) {
   // ---------- gränser (samma som Säkerkoll) ----------
   const MESSAGE_MAX_BYTES = 16 * 1024;     // krypterat meddelande (base64-tecken)
   const PUBKEY_MAX = 2000;
@@ -139,6 +139,69 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad, begr
   CREATE INDEX IF NOT EXISTS chatt_rapporter_target ON chatt_rapporter(target_id);
   CREATE TABLE IF NOT EXISTS chatt_hemligt(nyckel TEXT PRIMARY KEY, varde TEXT NOT NULL);`);
 
+  // ---------- Familjechatt: barnkonton ----------
+  // Ett barn (tabellen barn, loggar in med barnkod) får en egen dold rad i users som chattidentitet, så att
+  // all chattlogik (profil, nycklar, meddelanden) fungerar som för vuxna. Raden kan inte logga in på annat
+  // sätt (inget lösenord, ingen Google, mejl på .invalid) och tas bort med barnet.
+  // Regeln, här i servern: ett barn kan bara ha kontakt och grupper med sin egen familj (föräldern och syskonen).
+  db.exec(`CREATE TABLE IF NOT EXISTS chatt_barn(barn_id TEXT PRIMARY KEY REFERENCES barn(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE);
+  CREATE TRIGGER IF NOT EXISTS chatt_barn_bort AFTER DELETE ON chatt_barn BEGIN DELETE FROM users WHERE id=OLD.user_id; END;`);
+  function barnKonto(c) {
+    let r = q('SELECT user_id FROM chatt_barn WHERE barn_id=?').get(c.id);
+    if (!r) {
+      tx(() => {
+        r = q('SELECT user_id FROM chatt_barn WHERE barn_id=?').get(c.id);
+        if (r) return;
+        const info = nyttKonto({ email: 'barn-' + c.id + '-' + crypto.randomBytes(6).toString('hex') + '@barn.invalid', verified: 1, namn: c.namn });
+        r = { user_id: Number(info.lastInsertRowid) };
+        q('INSERT INTO chatt_barn(barn_id,user_id) VALUES(?,?)').run(c.id, r.user_id);
+      });
+    }
+    const u = q('SELECT * FROM users WHERE id=?').get(r.user_id);
+    u.barn = { id: c.id, foralder_id: c.foralder_id };
+    return u;
+  }
+  // Vuxen (AdRaze-konto) eller barn (barnsession) – samma 401 som förut om ingen av dem
+  function kravInloggad(req) {
+    try { return kravVuxen(req); } catch (e) {
+      if (typeof barnInloggad !== 'function') throw e;
+      let c; try { c = barnInloggad(req); } catch { throw e; }
+      return barnKonto(c);
+    }
+  }
+  const barnRad = (uid) => q('SELECT b.id, b.foralder_id FROM chatt_barn cb JOIN barn b ON b.id=cb.barn_id WHERE cb.user_id=?').get(uid);
+  const arBarn = (uid) => uid != null && !!barnRad(uid);
+  function familjFor(uid) {
+    const b = barnRad(uid), foralder = b ? b.foralder_id : uid;
+    const ids = new Set([foralder, ...q('SELECT cb.user_id FROM barn b JOIN chatt_barn cb ON cb.barn_id=b.id WHERE b.foralder_id=?').all(foralder).map((x) => x.user_id)]);
+    ids.delete(uid);
+    return ids;
+  }
+  // Får a och b ha kontakt? Vuxna sinsemellan alltid; är någon av dem ett barn bara inom familjen
+  const familjOk = (a, b) => (!arBarn(a) && !arBarn(b)) || familjFor(a).has(b);
+  // Familjen blir kontakter av sig själv (barnet behöver aldrig skicka förfrågningar)
+  const familjSynkad = new Map();
+  function synkaFamilj(uid) {
+    const t = familjSynkad.get(uid); if (t && now() - t < 60_000) return;
+    familjSynkad.set(uid, now());
+    if (familjSynkad.size > 20000) familjSynkad.clear();
+    for (const f of familjFor(uid)) {
+      if (!q('SELECT 1 FROM chatt_profiler WHERE user_id=?').get(f)) continue;
+      if (!arBarn(uid) && !arBarn(f)) continue;   // två vuxna (finns inte i samma familj i dag) – vanliga regler
+      if (isBlockedEither(uid, f)) continue;
+      const rad = q('SELECT id, status FROM chatt_kontakter WHERE (requester_id=? AND addressee_id=?) OR (requester_id=? AND addressee_id=?)').get(uid, f, f, uid);
+      if (!rad) q("INSERT INTO chatt_kontakter(requester_id,addressee_id,status,created_at) VALUES(?,?,'accepted',?)").run(uid, f, now());
+      else if (rad.status !== 'accepted') q("UPDATE chatt_kontakter SET status='accepted' WHERE id=?").run(rad.id);
+    }
+  }
+  // En grupp med ett barn i får bara bestå av barnets familj
+  function gruppFamiljOk(ids) {
+    for (const a of ids) if (arBarn(a)) { const fam = familjFor(a); for (const b of ids) if (b !== a && !fam.has(b)) return false; }
+    return true;
+  }
+  const FAMILJ_FEL = 'Barnkonton kan bara chatta med sin familj.';
+
   // Hemlighet för låtsas-salt i recovery/params (stabil över omstarter, så att saltet inte avslöjar vilka namn som finns)
   let HEMLIG = q("SELECT varde FROM chatt_hemligt WHERE nyckel='rec'").get()?.varde;
   if (!HEMLIG) { HEMLIG = crypto.randomBytes(32).toString('hex'); q("INSERT INTO chatt_hemligt(nyckel,varde) VALUES('rec',?)").run(HEMLIG); }
@@ -186,6 +249,7 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad, begr
     if (p.suspended_until && p.suspended_until > now()) { const s = suspendedBody(p.suspended_until); throw E(res, 403, 'suspended', s.message, { suspended_until: s.suspended_until }); }
     if (!p.last_seen || now() - p.last_seen > 60_000) q('UPDATE chatt_profiler SET last_seen=? WHERE user_id=?').run(now(), u.id);
     p.id = p.user_id; p.konto = u;
+    try { synkaFamilj(u.id); } catch {}
     return p;
   }
   const profilPaNamn = (lower) => q('SELECT user_id AS id, username FROM chatt_profiler WHERE username_lower=?').get(lower);
@@ -229,7 +293,7 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad, begr
   // ---------- relationer ----------
   const isBlockedEither = (a, b) => !!q('SELECT 1 FROM chatt_blockeringar WHERE (blocker_id=? AND blocked_id=?) OR (blocker_id=? AND blocked_id=?)').get(a, b, b, a);
   function areContacts(a, b) {
-    if (a == null || b == null || isBlockedEither(a, b)) return false;
+    if (a == null || b == null || isBlockedEither(a, b) || !familjOk(a, b)) return false;
     return !!q("SELECT 1 FROM chatt_kontakter WHERE status='accepted' AND ((requester_id=? AND addressee_id=?) OR (requester_id=? AND addressee_id=?))").get(a, b, b, a);
   }
   const dropContactRows = (a, b) => q('DELETE FROM chatt_kontakter WHERE (requester_id=? AND addressee_id=?) OR (requester_id=? AND addressee_id=?)').run(a, b, b, a);
@@ -778,7 +842,7 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad, begr
     const uname = String(query(req).get('username') || '').toLowerCase();
     if (!validUsername(uname)) throw E(res, 400, 'invalid_username');
     const u = q('SELECT p.user_id, p.username, p.public_key, a.avatar FROM chatt_profiler p JOIN users a ON a.id=p.user_id WHERE p.username_lower=?').get(uname);
-    if (!u || (u.user_id !== me && isBlockedEither(me, u.user_id))) return { exists: false };
+    if (!u || (u.user_id !== me && (isBlockedEither(me, u.user_id) || !familjOk(me, u.user_id)))) return { exists: false };   // barn syns bara för sin familj
     const nara = u.user_id === me || areContacts(me, u.user_id);
     return { exists: true, id: idUt(u.user_id), username: u.username, public_key: nara ? u.public_key : null, avatar: nara ? (u.avatar || null) : null };
   });
@@ -821,6 +885,7 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad, begr
     const target = profilPaNamn(uname);
     if (!target) throw E(res, 404, 'user_not_found', 'Hittar ingen med det namnet.');
     if (target.id === me) throw E(res, 400, 'cant_add_self', 'Du kan inte lägga till dig själv.');
+    if (!familjOk(me, target.id)) { if (arBarn(me)) throw E(res, 403, 'family_only', FAMILJ_FEL); throw E(res, 404, 'user_not_found', 'Hittar ingen med det namnet.'); }
     const them = target.id;
     if (isBlockedEither(me, them)) throw E(res, 403, 'blocked', 'Det går inte att lägga till den här användaren.');
     if (areContacts(me, them)) return { status: 'accepted' };
@@ -839,6 +904,7 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad, begr
     if (!validUsername(uname)) throw E(res, 400, 'invalid_username');
     const from = profilPaNamn(uname);
     if (!from) throw E(res, 404, 'user_not_found');
+    if (!familjOk(me, from.id)) throw E(res, 403, 'family_only', FAMILJ_FEL);
     if (isBlockedEither(me, from.id)) throw E(res, 403, 'blocked');
     const row = q("SELECT id FROM chatt_kontakter WHERE requester_id=? AND addressee_id=? AND status='pending'").get(from.id, me);
     if (!row) throw E(res, 404, 'no_pending_request');
@@ -852,6 +918,7 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad, begr
     if (!validUsername(uname)) throw E(res, 400, 'invalid_username');
     const them = profilPaNamn(uname);
     if (!them) throw E(res, 404, 'user_not_found');
+    if (arBarn(me) && familjFor(me).has(them.id)) throw E(res, 403, 'family_locked', 'Familjen går inte att ta bort.');
     dropContactRows(me, them.id);
     return {};
   });
@@ -863,6 +930,7 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad, begr
     const them = profilPaNamn(uname);
     if (!them) throw E(res, 404, 'user_not_found');
     if (them.id === me) throw E(res, 400, 'cant_block_self');
+    if (arBarn(me) && familjFor(me).has(them.id)) throw E(res, 403, 'family_locked', 'Familjen går inte att blockera.');
     tx(() => {
       q('INSERT OR IGNORE INTO chatt_blockeringar(blocker_id,blocked_id,created_at) VALUES(?,?,?)').run(me, them.id, now());
       dropContactRows(me, them.id);
@@ -1089,6 +1157,7 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad, begr
       if (!lista.some((x) => x.uid === uid)) lista.push({ uid, env: m.key_envelope });
     }
     if (!lista.some((m) => m.uid === me)) throw E(res, 400, 'creator_missing', 'Skaparen måste ingå i gruppen.');
+    if (!gruppFamiljOk(lista.map((m) => m.uid))) throw E(res, 403, 'family_only', FAMILJ_FEL);
     const gid = genId(), t = now();
     tx(() => {
       q('INSERT INTO chatt_grupper(id,name_enc,owner_id,created_at) VALUES(?,?,?,?)').run(gid, b.name_enc, me, t);
@@ -1169,6 +1238,7 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad, begr
     if (!finnsProfil(uid)) throw E(res, 404, 'user_not_found');
     if (isMember(gid, uid)) return { already_member: true };
     if (!areContacts(me, uid)) throw E(res, 403, 'not_contacts', 'Du kan bara lägga till dina kontakter.');
+    if (!gruppFamiljOk([uid, ...q('SELECT user_id FROM chatt_gruppmedlemmar WHERE group_id=?').all(gid).map((x) => x.user_id)])) throw E(res, 403, 'family_only', FAMILJ_FEL);
     if (q('SELECT COUNT(*) c FROM chatt_gruppmedlemmar WHERE group_id=?').get(gid).c >= MAX_GROUP_MEMBERS) throw E(res, 409, 'group_full', `Gruppen är full (max ${MAX_GROUP_MEMBERS}).`);
     q('INSERT INTO chatt_gruppmedlemmar(group_id,user_id,key_envelope,wrapped_by,joined_at,last_read_at) VALUES(?,?,?,?,?,0)').run(gid, uid, b.key_envelope, me, now());
     return {};

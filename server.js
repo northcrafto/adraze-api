@@ -781,7 +781,7 @@ rutt('GET', '/stod/status', async (req) => {
 });
 
 // Chatten (portad från Säkerkoll-communityn): vänner, grupper, E2E-meddelanden, bilder, stickers m.m. – se CHATT-API.md
-require('./chatt.js')({ rutt, q, db, fel, kravInloggad, begransad, now, sha, ipAv, crypto });
+require('./chatt.js')({ rutt, q, db, fel, kravInloggad, barnInloggad, nyttKonto, begransad, now, sha, ipAv, crypto });
 
 // AdRaze Pro (Stripe-prenumeration) och Falk, AI-assistenten i webbläsaren – se pro.js
 const pro = require('./pro.js')({ rutt, q, db, fel, kravInloggad, begransad, now });
