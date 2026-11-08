@@ -814,6 +814,8 @@ async function stripe(metod, sokvag, falt) {
 }
 
 rutt('POST', '/stod/kassa', async (req, res, b) => {
+  // Donationerna är borttagna (2026-11-08): man stöttar AdRaze genom att köpa Pro i webbläsaren
+  throw fel(410, 'Donationer finns inte längre. Stötta AdRaze genom att skaffa Pro i webbläsaren.');
   if (!STRIPE_KEY || !STRIPE_PK) throw fel(400, 'Betalning är inte igång just nu.');
   if (begransad(`stod:${ipAv(req)}`, 20, 3_600_000)) throw fel(429, 'För många försök. Vänta en stund.');
   // Belopp i kronor med upp till två decimaler. Gränserna är Stripes: minst 3 kr, högst 8 siffror i ören
