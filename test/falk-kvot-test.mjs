@@ -61,6 +61,8 @@ const rad = (id) => db.prepare('SELECT * FROM falk_kvot WHERE user_id=?').get(id
 let g = konto(false); ai.lage = 'svar'; ai.usage = 1000;
 let r = await fraga(g);
 koll('gratis: Falk svarar (ingen Pro-vägg)', r.s === 200 && r.j?.reply === 'Svar från låtsas-AI.', r);
+const r0 = await fraga(konto(false), 'Hej', { modell: 'deepseek' });
+koll('gratis: kan inte välja DeepSeek', ai.anrop.at(-1)?.model === 'qwen/qwen3.7-flash' && r0.j?.modell === 'qwen' && r0.j?.kvot?.modeller?.join() === 'qwen', [ai.anrop.at(-1)?.model, r0.j?.modell]);
 koll('gratis: Qwen-modellen och kort svarslängd', ai.anrop.at(-1)?.model === 'qwen/qwen3.7-flash' && ai.anrop.at(-1)?.max_tokens === 1500, ai.anrop.at(-1));
 koll('gratis: kvoten visas (50 000, 2 sökfrågor, 14 dagar)', r.j?.kvot?.plan === 'gratis' && r.j.kvot.tak === 50_000 && r.j.kvot.anvant === 1000 && r.j.kvot.sokKvar === 2
   && Math.abs(r.j.kvot.fyllsPa - (rad(g.id).start + 14 * 86400_000)) < 5, r.j?.kvot);
@@ -99,7 +101,14 @@ r = await fraga(p);
 koll('pro: DeepSeek och 4000 i svarslängd', ai.anrop.at(-1)?.model === 'deepseek/deepseek-v4-flash-0731' && ai.anrop.at(-1)?.max_tokens === 4000, ai.anrop.at(-1));
 koll('pro: kvoten 2 miljoner per 30 dagar, inga sökfrågegränser', r.j?.kvot?.plan === 'pro' && r.j.kvot.tak === 2_000_000 && r.j.kvot.sokKvar === null
   && Math.abs(r.j.kvot.fyllsPa - (rad(p.id).start + 30 * 86400_000)) < 5, r.j?.kvot);
+koll('pro: svaret säger att DeepSeek kördes och båda modellerna går att välja', r.j?.modell === 'deepseek' && r.j?.kvot?.modeller?.join() === 'deepseek,qwen', [r.j?.modell, r.j?.kvot?.modeller]);
+r = await fraga(p, 'Hej', { modell: 'qwen' });
+koll('pro: kan välja Qwen, med Pro-svarslängd', ai.anrop.at(-1)?.model === 'qwen/qwen3.7-flash' && ai.anrop.at(-1)?.max_tokens === 4000 && r.j?.modell === 'qwen', ai.anrop.at(-1));
+koll('pro: Qwen drar från samma kvot som DeepSeek', r.j?.kvot?.anvant === 2000, r.j?.kvot);
 db.prepare('UPDATE falk_kvot SET tokens=? WHERE user_id=?').run(2_000_000, p.id); fore = ai.anrop.length;
+r = await fraga(p, 'Hej', { modell: 'qwen' });
+koll('pro: kvoten slut på Qwen → slut även för DeepSeek', r.s === 429 && ai.anrop.length === fore, r.s);
+fore = ai.anrop.length;
 r = await fraga(p);
 koll('pro: slut på kvoten → 429 utan AI-anrop', r.s === 429 && r.j?.error === 'kvot_slut' && ai.anrop.length === fore, r);
 

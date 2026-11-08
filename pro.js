@@ -12,11 +12,14 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
   const AI_MODEL = process.env.AI_CHAT_MODEL || '';
   const AI_MODEL_GRATIS = process.env.AI_CHAT_MODEL_GRATIS || 'qwen/qwen3.7-flash';
   const DAG = 86_400_000;
+  // Modellerna Falk kan köra. Gratis kör alltid Qwen; Pro väljer själv och båda drar från samma kvot.
+  const MODELLER = { deepseek: { id: () => AI_MODEL, namn: 'DeepSeek V4 Flash' }, qwen: { id: () => AI_MODEL_GRATIS, namn: 'Qwen 3.7 Flash' } };
+  const valjModell = (planNamn, onskad) => planNamn === 'pro' ? (onskad === 'qwen' ? 'qwen' : 'deepseek') : 'qwen';
   // Falks kvoter. Perioden börjar vid första frågan och fylls på när den gått ut (eller när planen byts).
   // Gratis: 50 000 tokens och 2 frågor med webbsökning per 14 dagar. Pro: 2 miljoner tokens per 30 dagar.
   const KVOT = {
-    gratis: { modell: () => AI_MODEL_GRATIS, tokens: 50_000, period: 14 * DAG, sokfragor: 2, sokPerFraga: 2, lasPerFraga: 2, maxSvar: 1500, maxTecken: 60_000, perDygn: 60 },
-    pro: { modell: () => AI_MODEL, tokens: 2_000_000, period: 30 * DAG, sokfragor: Infinity, sokPerFraga: 8, lasPerFraga: 6, maxSvar: 4000, maxTecken: 280_000, perDygn: 300 },
+    gratis: { tokens: 50_000, period: 14 * DAG, sokfragor: 2, sokPerFraga: 2, lasPerFraga: 2, maxSvar: 1500, maxTecken: 60_000, perDygn: 60 },
+    pro: { tokens: 2_000_000, period: 30 * DAG, sokfragor: Infinity, sokPerFraga: 8, lasPerFraga: 6, maxSvar: 4000, maxTecken: 280_000, perDygn: 300 },
   };
   // Nödbroms för hela servern: så här många tokens per dygn (alla användare tillsammans) och anrop till AI:n per minut.
   // Räknat på dyraste leverantören blir 20 miljoner tokens högst runt 50 kr per dygn.
@@ -36,7 +39,7 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
   }
   function kvotUt(r) {
     const k = KVOT[r.plan];
-    return { plan: r.plan, anvant: Math.min(r.tokens, k.tokens), tak: k.tokens, kvar: Math.max(0, k.tokens - r.tokens),
+    return { plan: r.plan, modeller: r.plan === 'pro' ? ['deepseek', 'qwen'] : ['qwen'], anvant: Math.min(r.tokens, k.tokens), tak: k.tokens, kvar: Math.max(0, k.tokens - r.tokens),
       sokKvar: k.sokfragor === Infinity ? null : Math.max(0, k.sokfragor - r.sokfragor), fyllsPa: r.start + k.period };
   }
   const dagTokens = () => q('SELECT tokens FROM falk_dag WHERE dag=?').get(dagNu())?.tokens || 0;
@@ -220,7 +223,8 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
     try { return await falkSvar(u, b); } finally { pagar.delete(u.id); }
   });
   async function falkSvar(u, b) {
-    const planNamn = arPro(u) ? 'pro' : 'gratis', k = KVOT[planNamn], modell = k.modell();
+    const planNamn = arPro(u) ? 'pro' : 'gratis', k = KVOT[planNamn];
+    const modellNyckel = valjModell(planNamn, b.modell), modell = MODELLER[modellNyckel].id();
     const kv = kvotRad(u, planNamn);
     const kvotFel = () => Object.assign(fel(429, 'kvot'), { kropp: { ok: false, error: 'kvot_slut', kvot: kvotUt(kv),
       message: planNamn === 'pro' ? 'Du har använt hela din Falk-kvot för den här perioden. Den fylls på ' + new Date(kv.start + k.period).toLocaleDateString('sv-SE') + '.'
@@ -270,7 +274,7 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
       const flikAnrop = b.flik ? anrop.filter((a) => FLIK_NAMN.has(a.function?.name)) : [];
       if (flikAnrop.length) {
         const actions = flikAnrop.slice(0, 3).map((a) => { let arg = {}; try { arg = JSON.parse(a.function.arguments || '{}'); } catch {} return flikHandling(a.function.name, arg); }).filter(Boolean);
-        return { reply: (m.content || '').trim(), actions, sources: [], kvot: kvotUt(kv) };
+        return { reply: (m.content || '').trim(), actions, sources: [], kvot: kvotUt(kv), modell: modellNyckel };
       }
       msgs.push({ role: 'assistant', content: m.content || '', tool_calls: anrop });
       const utfall = await Promise.all(anrop.map(async (a) => {
@@ -307,7 +311,7 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
     const lagg = (k) => { const h = k.url.replace(/[#?].*$/, ''); if (lagt.has(h) || sources.length >= 6) return; lagt.add(h); sources.push({ title: k.titel, url: k.url }); };
     kallor.forEach(lagg);
     for (const t of traffar) { try { const host = new URL(t.url).hostname.replace(/^www\./, ''); if (svar.toLowerCase().includes(host.toLowerCase()) || svar.includes(t.url)) lagg(t); } catch {} }
-    return { reply: svar, sources, kvot: kvotUt(kv), ...(uppgradera ? { uppgradera } : {}) };
+    return { reply: svar, sources, kvot: kvotUt(kv), modell: modellNyckel, ...(uppgradera ? { uppgradera } : {}) };
   }
 
   function dsmlAnrop(text) {
