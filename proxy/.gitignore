@@ -1,3 +1,7 @@
 node_modules/
 webb
 extension
+transport/krypterad.wasm
+transport/krypterad.wasm.br
+transport/krypterad.wasm.gz
+transport/wasm_exec.js

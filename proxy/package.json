@@ -8,7 +8,8 @@
     "@mercuryworkshop/bare-mux": "2.1.9",
     "@mercuryworkshop/libcurl-transport": "1.5.2",
     "@mercuryworkshop/scramjet": "1.1.0",
-    "@mercuryworkshop/wisp-js": "0.5.2"
+    "@mercuryworkshop/wisp-js": "0.5.2",
+    "impit": "0.14.8"
   },
   "license": "AGPL-3.0-only"
 }

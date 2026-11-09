@@ -3,8 +3,14 @@
 // Så funkar det:
 //  - Sidan (webb/, byggd av ~/adraze/site/bygg.py) registrerar en service worker (Scramjet) som skriver om
 //    sidorna så att allt de hämtar går genom proxyn.
-//  - Trafiken går krypterad (TLS i webbläsaren via libcurl.js) genom en Wisp-websocket hit, och servern öppnar bara
-//    TCP-anslutningen åt dig. Vi kan alltså inte läsa sidorna du besöker, bara se värdnamnen.
+//  - Två lägen som besökaren väljer:
+//    * Fullt krypterad (standard): TLS görs i webbläsaren av transport/krypterad.wasm (Go + uTLS, samma
+//      handskakning som Chrome, källkod i krypterad/) genom en Wisp-websocket hit, och servern öppnar bara
+//      TCP-anslutningen. Vi kan alltså inte läsa sidorna, bara se värdnamnen.
+//    * Lätt (serverhamtning.mjs): servern hämtar sidan själv med en Chrome-lik anslutning (impit), som de flesta
+//      webbproxyer. Trafiken är då okrypterad på servern medan den passerar (den loggas eller sparas inte).
+//    Sajter som TikTok avvisar allt utan Chromes TLS-handskakning, därför ser båda lägena ut som Chrome.
+//    Websockets går i båda lägena genom libcurl.js (TLS i webbläsaren).
 //  - Adblockern sitter i tre lager: 1) servern vägrar ansluta till reklam-/spårar-/farliga värdar,
 //    2) service workern prövar varje förfrågan mot tilläggets regler med full adress, 3) sidorna får tilläggets
 //    kosmetiska CSS (/adraze/k.css) som döljer annonsytor och kakrutor.
@@ -20,6 +26,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
 import { server as wisp, logging } from '@mercuryworkshop/wisp-js/server';
+import { skapaServerhamtning } from './serverhamtning.mjs';
 
 const require = createRequire(import.meta.url);
 const F = require('./filtermotor.cjs');
@@ -172,16 +179,16 @@ function cssFor(host) {
 // ---------- Wisp: servern ansluter bara dit vi tillåter ----------
 const EGNA = /(^|\.)(proxy\.adraze\.app|localhost|ts\.net|local|internal|lan|home\.arpa)$/i;
 const statistik = { stoppade: 0, anslutningar: 0, start: Date.now() };
-wisp.options.hostname_blacklist = [{
-  test(host) {
-    // Samma namn med avslutande punkt ("proxy.adraze.app.") eller versaler ska stoppas likadant
-    host = String(host).toLowerCase().replace(/\.+$/, '');
-    if (EGNA.test(host)) return true;
-    const kat = regler?.server.vard(host);
-    if (kat) { statistik.stoppade++; return true; }
-    return false;
-  },
-}];
+// Samma kontroll för Wisp och läget "Lätt"
+function vardStoppad(host) {
+  // Samma namn med avslutande punkt ("proxy.adraze.app.") eller versaler ska stoppas likadant
+  host = String(host).toLowerCase().replace(/\.+$/, '');
+  if (EGNA.test(host)) return true;
+  const kat = regler?.server.vard(host);
+  if (kat) { statistik.stoppade++; return true; }
+  return false;
+}
+wisp.options.hostname_blacklist = [{ test: vardStoppad }];
 wisp.options.port_whitelist = [80, 443];
 wisp.options.allow_udp_streams = false;
 wisp.options.allow_direct_ip = false;     // annars går värdlistan att kringgå med en IP-adress
@@ -216,6 +223,7 @@ async function slaUppPublik(host) {
 wisp.options.dns_method = slaUppPublik;
 wisp.options.parse_real_ip_from = ['127.0.0.1', '::1'];
 wisp.options.wisp_motd = 'AdRaze Proxy';
+const serverhamtning = skapaServerhamtning({ vardStoppad, slaUppPublik, ipAv: (req) => ipAv(req) });
 
 // ---------- HTTP ----------
 const TYPER = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.cjs': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
@@ -226,6 +234,7 @@ const MOTOR = {
   scram: path.join(NM, 'scramjet', 'dist'),
   baremux: path.join(NM, 'bare-mux', 'dist'),
   libcurl: path.join(NM, 'libcurl-transport', 'dist'),
+  adraze: path.join(DIR, 'transport'),
 };
 const SAKERHET = {
   'X-Content-Type-Options': 'nosniff',
@@ -269,6 +278,20 @@ function skickaKomprimerat(req, res, typ, data, huvud) {
   res.end(data.gz ? zlib.gunzipSync(data.gz) : data.raw);
 }
 
+
+// Krypterade lägets motor (~13 MB, ~2,5 MB med brotli): förkomprimerad av krypterad/bygg.sh, läses in en gång
+let wasmPost = null;
+function skickaWasm(req, res) {
+  try {
+    const bas = path.join(DIR, 'transport', 'krypterad.wasm');
+    const st = fs.statSync(bas);
+    if (!wasmPost || wasmPost.mtime !== st.mtimeMs) {
+      wasmPost = { mtime: st.mtimeMs, etag: `"w${st.size.toString(36)}-${Math.floor(st.mtimeMs).toString(36)}"`,
+        br: fs.readFileSync(bas + '.br'), gz: fs.readFileSync(bas + '.gz') };
+    }
+  } catch { return skickaFel(req, res, 404); }
+  return skickaKomprimerat(req, res, 'application/wasm', { br: wasmPost.br, gz: wasmPost.gz }, { ETag: wasmPost.etag, 'Cache-Control': 'no-cache' });
+}
 
 // ---------- bilder till ny flik-sidan ----------
 // Bakgrundsfoton (Pexels) och genvägsikoner (DuckDuckGo) hämtas av servern, så att besökarens IP aldrig når dem.
@@ -384,6 +407,7 @@ const server = http.createServer((req, res) => {
 function hantera(req, res) {
   let u, p;
   try { u = new URL(req.url, 'http://x'); p = decodeURIComponent(u.pathname); } catch { return skickaFel(req, res, 400); }
+  if (p === '/adraze/hamta' && req.method === 'POST') return void serverhamtning.hamta(req, res).catch(misslyckad(req, res, 500));
   if (req.method !== 'GET' && req.method !== 'HEAD') return skickaFel(req, res, 405);
 
   if (p === '/sw.js') return skickaFil(req, res, path.join(WEBB, 'sw.js'), { 'Cache-Control': 'no-cache', 'Service-Worker-Allowed': '/' });
@@ -427,9 +451,10 @@ function hantera(req, res) {
   if (im) return im[1].length > 250 ? skickaFel(req, res, 404) : void skickaIkon(req, res, im[1]).catch(misslyckad(req, res));
   if (p === '/adraze/status') {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...SAKERHET });
-    return res.end(JSON.stringify({ ok: true, regler: regler.version, anslutna: aktiva.totalt, stoppade: statistik.stoppade, sedan: statistik.start }));
+    return res.end(JSON.stringify({ ok: true, regler: regler.version, anslutna: aktiva.totalt, serverhamtning: serverhamtning.aktiva.totalt, stoppade: statistik.stoppade, sedan: statistik.start }));
   }
-  const m = /^\/motor\/(scram|baremux|libcurl)\/(.+)$/.exec(p);
+  if (p === '/motor/adraze/krypterad.wasm') return skickaWasm(req, res);
+  const m = /^\/motor\/(scram|baremux|libcurl|adraze)\/(.+)$/.exec(p);
   if (m) {
     const fil = inom(MOTOR[m[1]], m[2]);
     return fil ? skickaFil(req, res, fil, { 'Cache-Control': 'public, max-age=86400' }) : skickaFel(req, res, 404);

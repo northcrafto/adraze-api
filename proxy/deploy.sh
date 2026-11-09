@@ -1,9 +1,12 @@
 #!/bin/bash
 # Lägger ut AdRaze Proxy på doxing: serverkoden härifrån, sidan från ~/adraze/proxy (bygg först med
 # python3 ~/adraze/site/bygg.py) och tilläggets regler/kosmetik/sidskript från ~/adraze/extension.
+# Krypterade lägets motor (transport/krypterad.wasm) byggs inte i git: kör krypterad/bygg.sh (Go >= 1.24) först
+# om krypterad/main.go ändrats eller filen saknas.
 # Kör: ./deploy.sh   (startar bara om adraze-proxy)
 set -euo pipefail
 cd "$(dirname "$0")"
+[ -f transport/krypterad.wasm.br ] || { echo "transport/krypterad.wasm saknas: kör krypterad/bygg.sh först" >&2; exit 1; }
 MAL=doxing:adraze-api/proxy
 ssh doxing 'mkdir -p ~/adraze-api/proxy/webb ~/adraze-api/proxy/extension'
 rsync -a --delete --exclude node_modules --exclude webb --exclude extension ./ "$MAL/"
