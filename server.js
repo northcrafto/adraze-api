@@ -119,7 +119,7 @@ const MAIL_PER_DAG = Number(process.env.MAIL_PER_DAG || 150);
 //  drift  – supportärenden och citatförslag
 //  konto  – inloggningskod efter rätt lösenord, familjekoder och teamets svar i support
 // oppen och drift har egna tak, så de kan aldrig ta det som konto behöver; konto får resten av totalen.
-const MAIL_KLASSTAK = { oppen: Number(process.env.MAIL_OPPEN_PER_DAG || 60), drift: Number(process.env.MAIL_DRIFT_PER_DAG || 40) };
+const MAIL_KLASSTAK = { oppen: Number(process.env.MAIL_OPPEN_PER_DAG || 60), drift: Number(process.env.MAIL_DRIFT_PER_DAG || 40), samtal: Number(process.env.MAIL_SAMTAL_PER_DAG || 30) };
 db.exec('CREATE TABLE IF NOT EXISTS mejl_kvot(dag TEXT NOT NULL, klass TEXT NOT NULL, n INTEGER NOT NULL, PRIMARY KEY(dag, klass))');
 function taMejlKvot(klass) {
   const dag = new Date().toISOString().slice(0, 10);
@@ -848,7 +848,7 @@ rutt('GET', '/stod/status', async (req) => {
 });
 
 // Chatten (portad från Säkerkoll-communityn): vänner, grupper, E2E-meddelanden, bilder, stickers m.m. – se CHATT-API.md
-require('./chatt.js')({ rutt, q, db, fel, kravInloggad, barnInloggad, nyttKonto, begransad, now, sha, ipAv, crypto });
+require('./chatt.js')({ rutt, q, db, fel, kravInloggad, barnInloggad, nyttKonto, begransad, now, sha, ipAv, crypto, skickaMejl, mejlLayout, mejlText, esc, SAJT });
 // Temagalleriet: delade teman med topplista – se galleri.js (efter chatten: skaparens namn är användarnamnet där)
 require('./galleri.js')({ rutt, q, db, fel, inloggad, kravInloggad, barnInloggad, begransad, now, sha, ipAv, crypto });
 

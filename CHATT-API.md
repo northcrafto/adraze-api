@@ -41,8 +41,8 @@ Ingen hemlig kod längre: servern håller en slumpad hemlighet per konto (32 byt
 
 | Metod | Rutt | In | Ut |
 |---|---|---|---|
-| GET | `/chatt/users/privacy` | – | `{privacy:{read_receipts, typing, requests:"all"\|"none", show_pro}}` |
-| POST | `/chatt/users/privacy` | valfria av `{read_receipts, typing, show_pro}` (bool), `requests` | `{privacy}` |
+| GET | `/chatt/users/privacy` | – | `{privacy:{read_receipts, typing, requests:"all"\|"none", show_pro, presence, call_mail}}` (`presence`, `call_mail` är `true` om inget satts) |
+| POST | `/chatt/users/privacy` | valfria av `{read_receipts, typing, show_pro, presence, call_mail}` (bool), `requests` | `{privacy}`. `presence:false` = visa inte när jag är online (och se inte andras); `call_mail:false` = inga mejl om missade samtal |
 | POST | `/chatt/users/bubble` | `{color?:"#rrggbb", frame?: alg\|groda\|katt\|haj\|bjorn\|drake}` (båda tomma = ta bort) | `{bubble:{color,frame}\|null}`; `400 invalid_bubble` |
 | POST | `/chatt/users/avatar` | `{avatar: dataURL-JPEG \| null \| ""}` (≤120 000 tecken) | `{avatar}`; `400 invalid_avatar`. Skriver `users.avatar` |
 | POST | `/chatt/users/bio` | `{bio: text≤300 \| null \| ""}` | `{bio}`; `400 invalid_bio` |
@@ -74,7 +74,7 @@ Ingen hemlig kod längre: servern håller en slumpad hemlighet per konto (32 byt
 | POST | `/chatt/contacts/remove` | `{username}` | `{}` |
 | POST | `/chatt/contacts/block` | `{username}` | `{}`; `400 cant_block_self` |
 | POST | `/chatt/contacts/unblock` | `{username}` | `{}` |
-| GET | `/chatt/contacts` | – | `{contacts:[{id, username, avatar, bubble}], incoming:[{id, username, avatar}], outgoing:[…], blocked:[{id, username}]}` |
+| GET | `/chatt/contacts` | – | `{contacts:[{id, username, avatar, bubble, online, last_seen}], incoming:[{id, username, avatar}], outgoing:[…], blocked:[{id, username}]}` |
 
 ## Meddelanden
 
@@ -107,7 +107,7 @@ Bilagor som laddats upp men aldrig skickats städas efter 6 h. En bilaga kan bar
 |---|---|---|---|
 | POST | `/chatt/groups/create` | `{name_enc, members:[{user_id, key_envelope}]}` (1–50, skaparen ska ingå) | `{id, created_at}`; `400 invalid_name/invalid_members/invalid_member_entry/creator_missing`, `404 member_not_found`, `403 not_contacts` |
 | GET | `/chatt/groups` | – | `{groups:[{id, name_enc, owner_id, avatar_enc, key_envelope, wrapped_by, member_count, last_message_at, unread}]}` |
-| GET | `/chatt/groups/members?id=` | – | `{owner_id, members:[{id, username, avatar, joined_at, is_admin}]}`; `403 not_member` |
+| GET | `/chatt/groups/members?id=` | – | `{owner_id, members:[{id, username, avatar, joined_at, is_admin, online?, last_seen?}]}` (online-fälten bara för mig själv och mina kontakter); `403 not_member` |
 | GET | `/chatt/groups/messages?id=&since=&changed_since=` | – | `{messages:[{id, sender_id, sender_username, sender_bubble, mine, ciphertext, created_at, deleted, edited}], server_time, reads:[{id, username, read_at}], typing:[username], changes}`; `403 not_member` |
 | POST | `/chatt/groups/messages` | `{id, ciphertext, attachment_id?}` | `{id, created_at}` (`id` i svaret = meddelandets id) |
 | POST | `/chatt/groups/members` | `{id, user_id, key_envelope}` | `{}` eller `{already_member:true}`; `409 group_full`, `403 not_contacts` |
@@ -120,6 +120,38 @@ Bilagor som laddats upp men aldrig skickats städas efter 6 h. En bilaga kan bar
 | POST | `/chatt/groups/messages/edit` | `{gid, id, ciphertext}` | `{}`; `403 not_member/not_sender`, `404` |
 | POST | `/chatt/groups/messages/delete` | `{gid, id}` | `{}` |
 | POST | `/chatt/groups/messages/hide` | `{gid, id}` | `{}` |
+
+## Online-status
+
+`online` (bool) och `last_seen` (ms, avrundat nedåt till 5 min) i kontaktlistan och gruppens medlemslista. Online = AdRaze
+har frågat servern de senaste 2 minuterna (chattpanelen laddas dold så fort man är inloggad, så det betyder "AdRaze är igång
+och inloggad"). Båda fälten är `null` om någon av de två har slagit av `presence`.
+
+## Samtal (ringsignal)
+
+Själva samtalet går direkt mellan datorerna (WebRTC). Offer/answer skickas som krypterade kontrollposter i meddelandekanalen
+(se nedan); servern ser bara chiffertext. Rutterna här är bara ringsignalen: vem som ringer och ett slumpat samtals-id, i minnet.
+
+| Metod | Rutt | In | Ut |
+|---|---|---|---|
+| POST | `/chatt/samtal/ring` | `{to_id, call_id}` (call_id 12–40 tecken `[A-Za-z0-9_-]`) | `{call_id, ring_ms}`; `403 not_contacts` (barnkonton: bara familjen), `409 call_exists`, `429` (30 per 10 min). Ett äldre utgående samtal som fortfarande ringer läggs på |
+| GET | `/chatt/samtal` | – | `{incoming:[{call_id, from_id, from_username, started_at, ring_ms}], calls:[{call_id, state, with_id, outgoing}], server_time}` |
+| POST | `/chatt/samtal/svar` | `{call_id, svar:"svara"\|"avboj"}` | `{state}`; `404 not_found` (bara mottagaren) |
+| POST | `/chatt/samtal/avsluta` | `{call_id}` | `{state}`; `404 not_found`. Den som ringer och lägger på efter minst 8 s ringning = `missat` |
+
+`state`: `ringer`, `svarat`, `avbojt`, `missat`, `avslutat`. Ringer det i 30 s utan svar blir det `missat`. Har det ringt minst
+8 s får mottagaren ett mejl "<användarnamn> försökte ringa dig i AdRaze" om: `call_mail` är på, kontot är verifierat, inte
+ett barnkonto och inte en `.invalid`-adress, och det inte gått något sådant mejl för samma par de senaste 30 minuterna
+(mejlklassen `samtal`, `MAIL_SAMTAL_PER_DAG`, standard 30).
+
+## Kontrollposter (klienten, servern ser bara chiffertext)
+
+Reaktioner, samtal och skärmdelning skickas som vanliga krypterade meddelanden med klartexten
+`{"sk":"txt","c":"<reservtext>","r"?:<citat>,"ax":{…}}`. Gamla klienter visar `c` som ett vanligt meddelande; nya läser `ax`:
+
+- `{t:"rx", m:"<meddelande-id>", e:"<emoji>", on:bool}` – reaktion. En post per person, meddelande och emoji; ändras med edit.
+- `{t:"ring", h:"offer"|"answer"|"slut", s:"<samtals-id>", sdp?, o?, d?}` – röstsamtal (o = missat/avbojt/klart/avbrutet, d = sekunder).
+- `{t:"sk", h:"start"|"offer"|"answer"|"slut", s, n?, till?, sdp?}` – visa en flik (skärmdelning), högst 4 tittare.
 
 ## Finns inte (medvetet)
 

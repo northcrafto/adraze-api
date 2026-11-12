@@ -18,7 +18,7 @@ const _net = require('node:net');
 const _http = require('node:http');
 const _https = require('node:https');
 
-module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad: kravVuxen, barnInloggad, nyttKonto, begransad, now, sha, ipAv, crypto = nodeCrypto }) {
+module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad: kravVuxen, barnInloggad, nyttKonto, begransad, now, sha, ipAv, crypto = nodeCrypto, skickaMejl, mejlLayout, mejlText, esc, SAJT }) {
   // ---------- gränser (samma som Säkerkoll) ----------
   const MESSAGE_MAX_BYTES = 16 * 1024;     // krypterat meddelande (base64-tecken)
   const PUBKEY_MAX = 2000;
@@ -39,6 +39,7 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad: krav
   const MAX_PROFILES_PER_IP = 60;          // per IP och rullande dygn
   const AVATAR_MAX = 120_000;              // samma som /me/avatar i server.js
   const KVART = 15 * 60 * 1000;
+  const ONLINE_MS = 2 * 60 * 1000;          // online = något chattanrop de senaste 2 min (last_seen skrivs högst var 30:e s)
 
   // Större kroppar än routerns standard (16 kB) bara där det behövs
   const MAX = {
@@ -247,7 +248,7 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad: krav
     const p = q('SELECT * FROM chatt_profiler WHERE user_id=?').get(u.id);
     if (!p) throw E(res, 403, 'no_profile', 'Välj ett användarnamn för chatten först.');
     if (p.suspended_until && p.suspended_until > now()) { const s = suspendedBody(p.suspended_until); throw E(res, 403, 'suspended', s.message, { suspended_until: s.suspended_until }); }
-    if (!p.last_seen || now() - p.last_seen > 60_000) q('UPDATE chatt_profiler SET last_seen=? WHERE user_id=?').run(now(), u.id);
+    if (!p.last_seen || now() - p.last_seen > 30_000) q('UPDATE chatt_profiler SET last_seen=? WHERE user_id=?').run(now(), u.id);
     p.id = p.user_id; p.konto = u;
     try { synkaFamilj(u.id); } catch {}
     return p;
@@ -285,7 +286,8 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad: krav
   function getPrivacy(uid) {
     let o = {};
     try { const r = q('SELECT privacy FROM chatt_profiler WHERE user_id=?').get(uid); o = r && r.privacy ? JSON.parse(r.privacy) : {}; } catch {}
-    return { read_receipts: o.read_receipts !== false, typing: o.typing !== false, requests: o.requests === 'none' ? 'none' : 'all', show_pro: o.show_pro !== false };
+    return { read_receipts: o.read_receipts !== false, typing: o.typing !== false, requests: o.requests === 'none' ? 'none' : 'all', show_pro: o.show_pro !== false,
+      presence: o.presence !== false, call_mail: o.call_mail !== false };
   }
   const BUBBLE_FRAMES = new Set(['alg', 'groda', 'katt', 'haj', 'bjorn', 'drake']);
   function parseBubble(s) { if (!s) return null; try { const o = JSON.parse(s); return { color: o.color || null, frame: o.frame || null }; } catch { return null; } }
@@ -471,7 +473,7 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad: krav
   rutt('GET', '/chatt/users/privacy', (req, res) => ({ privacy: getPrivacy(profil(req, res).id) }));
   rutt('POST', '/chatt/users/privacy', (req, res, b) => {
     const me = profil(req, res).id, cur = getPrivacy(me);
-    for (const k of ['read_receipts', 'typing', 'show_pro']) if (typeof b[k] === 'boolean') cur[k] = b[k];
+    for (const k of ['read_receipts', 'typing', 'show_pro', 'presence', 'call_mail']) if (typeof b[k] === 'boolean') cur[k] = b[k];
     if (b.requests === 'all' || b.requests === 'none') cur.requests = b.requests;
     q('UPDATE chatt_profiler SET privacy=? WHERE user_id=?').run(JSON.stringify(cur), me);
     if (!cur.typing) for (const k of typingMap.keys()) if (k.startsWith('dm:' + me + ':') || k.endsWith(':' + me)) typingMap.delete(k);
@@ -951,7 +953,7 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad: krav
 
   rutt('GET', '/chatt/contacts', (req, res) => {
     const me = profil(req, res).id;
-    const accepted = q(`SELECT CAST(p.user_id AS TEXT) AS id, p.username, a.avatar, p.bubble FROM chatt_kontakter c
+    const accepted = q(`SELECT CAST(p.user_id AS TEXT) AS id, p.username, a.avatar, p.bubble, p.last_seen FROM chatt_kontakter c
       JOIN chatt_profiler p ON p.user_id = CASE WHEN c.requester_id=? THEN c.addressee_id ELSE c.requester_id END
       JOIN users a ON a.id=p.user_id
       WHERE c.status='accepted' AND (c.requester_id=? OR c.addressee_id=?) ORDER BY p.username COLLATE NOCASE`).all(me, me, me);
@@ -959,10 +961,17 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad: krav
       JOIN users a ON a.id=p.user_id WHERE c.addressee_id=? AND c.status='pending' ORDER BY c.created_at DESC`).all(me);
     const outgoing = q(`SELECT CAST(p.user_id AS TEXT) AS id, p.username, a.avatar FROM chatt_kontakter c JOIN chatt_profiler p ON p.user_id=c.addressee_id
       JOIN users a ON a.id=p.user_id WHERE c.requester_id=? AND c.status='pending' ORDER BY c.created_at DESC`).all(me);
-    for (const c of accepted) c.bubble = parseBubble(c.bubble);
+    const jagSyns = getPrivacy(me).presence;
+    for (const c of accepted) { c.bubble = parseBubble(c.bubble); Object.assign(c, narvaro(jagSyns, Number(c.id), c.last_seen)); }
     const blocked = q('SELECT CAST(p.user_id AS TEXT) AS id, p.username FROM chatt_blockeringar b JOIN chatt_profiler p ON p.user_id=b.blocked_id WHERE b.blocker_id=? ORDER BY b.created_at DESC').all(me);
     return { contacts: accepted.map(utRad), incoming: incoming.map(utRad), outgoing: outgoing.map(utRad), blocked: blocked.map(utRad) };
   });
+  // Närvaro (online-pricken): bara mellan kontakter, och bara om båda visar sin. Ingen ny klartext utöver
+  // "senast aktiv i chatten" (redan last_seen), avrundat nedåt till 5 min så att den inte blir en exakt logg.
+  function narvaro(jagSyns, uid, ls) {
+    if (!jagSyns || !getPrivacy(uid).presence) return { online: null, last_seen: null };
+    return { online: !!ls && now() - ls < ONLINE_MS, last_seen: ls ? Math.floor(ls / 300_000) * 300_000 : null };
+  }
   // node:sqlite ger rader med null-prototyp; gör om till vanliga objekt
   const utRad = (r) => ({ ...r });
 
@@ -1183,8 +1192,10 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad: krav
     const gid = gidIn(query(req).get('id'));
     if (!isMember(gid, me)) throw E(res, 403, 'not_member');
     const g = q('SELECT owner_id FROM chatt_grupper WHERE id=?').get(gid);
-    const members = q(`SELECT CAST(p.user_id AS TEXT) AS id, p.username, a.avatar, gm.joined_at, gm.is_admin FROM chatt_gruppmedlemmar gm
-      JOIN chatt_profiler p ON p.user_id=gm.user_id JOIN users a ON a.id=p.user_id WHERE gm.group_id=? ORDER BY p.username COLLATE NOCASE`).all(gid).map(utRad);
+    const jagSyns = getPrivacy(me).presence;
+    const members = q(`SELECT CAST(p.user_id AS TEXT) AS id, p.username, a.avatar, gm.joined_at, gm.is_admin, p.last_seen FROM chatt_gruppmedlemmar gm
+      JOIN chatt_profiler p ON p.user_id=gm.user_id JOIN users a ON a.id=p.user_id WHERE gm.group_id=? ORDER BY p.username COLLATE NOCASE`).all(gid)
+      .map((m) => { const uid = Number(m.id); return { ...m, ...(uid === me || areContacts(me, uid) ? narvaro(jagSyns, uid, m.last_seen) : { online: null, last_seen: null }) }; });
     return { owner_id: g ? idUt(g.owner_id) : null, members };
   });
 
@@ -1349,6 +1360,102 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad: krav
     if (!m) throw E(res, 404, 'not_found');
     q("INSERT OR IGNORE INTO chatt_dolda(user_id,kind,message_id) VALUES(?,'group',?)").run(me, id);
     return {};
+  });
+
+  // ======================================================================
+  // Samtal: bara RINGSIGNALEN går via servern (vem som ringer + ett samtals-id, inget innehåll), så att den når
+  // mottagaren inom ett par sekunder. Själva samtalet (WebRTC offer/answer) skickas som krypterade kontrollposter
+  // i meddelandekanalen; servern ser aldrig ljud, SDP eller nycklar. Allt här ligger bara i minnet.
+  // Missat samtal (ingen svarade inom RING_MS, eller den som ringde lade på efter minst MISSAT_MIN_MS):
+  // mottagaren får ett mejl om det är påslaget, högst ett per uppringare och mottagare per MEJL_PAUS_MS.
+  // ======================================================================
+  const RING_MS = 30_000, MISSAT_MIN_MS = 8_000, MEJL_PAUS_MS = 30 * 60_000, SAMTAL_MINNE_MS = 2 * 60_000;
+  const samtal = new Map();          // call_id → { id, from, to, start, state, slut }
+  const samtalMejlat = new Map();    // "från:till" → tid för senaste mejlet
+  const callIdIn = (x) => (typeof x === 'string' && /^[A-Za-z0-9_-]{12,40}$/.test(x) ? x : null);
+  const SLUT = new Set(['avbojt', 'missat', 'avslutat']);
+  function samtalSlut(c, state) {
+    if (SLUT.has(c.state)) return;
+    const varRingning = c.state === 'ringer';
+    c.state = state; c.slut = now();
+    if (state === 'missat' && varRingning) mejlaMissat(c).catch((e) => console.error('[chatt] samtalsmejl:', e.message));
+  }
+  async function mejlaMissat(c) {
+    if (typeof skickaMejl !== 'function' || typeof mejlLayout !== 'function') return false;
+    if (!getPrivacy(c.to).call_mail || arBarn(c.to)) return false;
+    const u = q('SELECT email, verified FROM users WHERE id=?').get(c.to);
+    if (!u || !u.verified || !u.email || /\.invalid$/i.test(u.email)) return false;
+    const nyckel = c.from + ':' + c.to, t = samtalMejlat.get(nyckel);
+    if (t && now() - t < MEJL_PAUS_MS) return false;
+    const fran = q('SELECT username FROM chatt_profiler WHERE user_id=?').get(c.from);
+    if (!fran) return false;
+    samtalMejlat.set(nyckel, now());
+    if (samtalMejlat.size > 20000) { const f = now() - MEJL_PAUS_MS; for (const [k, v] of samtalMejlat) if (v < f) samtalMejlat.delete(k); }
+    const sajt = SAJT || 'https://adraze.app';
+    const rubrik = `${fran.username} försökte ringa dig i AdRaze`;
+    const knapp = `<tr><td align="center" style="padding-top:26px"><a href="${sajt}" style="display:inline-block;background:#17171a;color:#ffffff;text-decoration:none;font-weight:600;font-size:15px;padding:14px 26px;border-radius:999px">Öppna AdRaze</a></td></tr>`;
+    const text = 'Öppna chatten i AdRaze-webbläsaren för att ringa tillbaka. Du kan stänga av de här mejlen i chattens inställningar, under Sekretess.';
+    return skickaMejl(u.email, rubrik, mejlLayout(rubrik, mejlText(esc(text)) + knapp), `${rubrik}.\n\n${text}\n\n${sajt}`, undefined, 'samtal');
+  }
+  function samtalSvep() {
+    const t = now();
+    for (const [id, c] of samtal) {
+      if (c.state === 'ringer' && t - c.start > RING_MS) samtalSlut(c, 'missat');
+      if (c.slut && t - c.slut > SAMTAL_MINNE_MS) samtal.delete(id);
+      else if (!c.slut && t - c.start > 6 * 3600_000) samtal.delete(id);   // ett samtal som ingen avslutade
+    }
+  }
+  setInterval(samtalSvep, 2000).unref();
+
+  rutt('POST', '/chatt/samtal/ring', (req, res, b) => {
+    const me = profil(req, res).id;
+    grans(req, res, 'ring', 30, 10 * 60_000, 'Du har ringt väldigt många gånger. Vänta en stund.', me);
+    const to = idIn(b.to_id), id = callIdIn(b.call_id);
+    if (!to || !id) throw E(res, 400, 'invalid_input');
+    if (to === me) throw E(res, 400, 'invalid_input');
+    if (!areContacts(me, to)) throw E(res, 403, 'not_contacts', 'Ni är inte kontakter.');
+    if (samtal.has(id)) throw E(res, 409, 'call_exists');
+    // Bara ett utgående samtal i taget: ett äldre som fortfarande ringer läggs på
+    for (const c of samtal.values()) if (c.from === me && c.state === 'ringer') samtalSlut(c, 'avslutat');
+    samtal.set(id, { id, from: me, to, start: now(), state: 'ringer', slut: 0 });
+    return { call_id: id, ring_ms: RING_MS };
+  });
+
+  // Pollas ofta (var 2–3:e s) av varje öppen chatt: inkommande ringningar + läget för mina egna samtal
+  rutt('GET', '/chatt/samtal', (req, res) => {
+    const me = profil(req, res).id;
+    samtalSvep();
+    const incoming = [], mine = [];
+    for (const c of samtal.values()) {
+      if (c.to === me && c.state === 'ringer' && areContacts(me, c.from)) {
+        const p = q('SELECT username FROM chatt_profiler WHERE user_id=?').get(c.from);
+        incoming.push({ call_id: c.id, from_id: idUt(c.from), from_username: p ? p.username : '', started_at: c.start, ring_ms: RING_MS });
+      }
+      if (c.from === me || c.to === me) mine.push({ call_id: c.id, state: c.state, with_id: idUt(c.from === me ? c.to : c.from), outgoing: c.from === me });
+    }
+    return { incoming, calls: mine, server_time: now() };
+  });
+
+  // Mottagaren: svara eller avböj
+  rutt('POST', '/chatt/samtal/svar', (req, res, b) => {
+    const me = profil(req, res).id;
+    const c = samtal.get(callIdIn(b.call_id) || '');
+    if (!c || c.to !== me) throw E(res, 404, 'not_found');
+    if (c.state !== 'ringer') return { state: c.state };
+    if (b.svar === 'svara') c.state = 'svarat';
+    else if (b.svar === 'avboj') samtalSlut(c, 'avbojt');
+    else throw E(res, 400, 'invalid_input');
+    return { state: c.state };
+  });
+
+  // Endera parten lägger på. Den som ringer och lägger på under ringningen = missat (om det ringt en stund)
+  rutt('POST', '/chatt/samtal/avsluta', (req, res, b) => {
+    const me = profil(req, res).id;
+    const c = samtal.get(callIdIn(b.call_id) || '');
+    if (!c || (c.from !== me && c.to !== me)) throw E(res, 404, 'not_found');
+    if (c.state === 'ringer') samtalSlut(c, c.from === me && now() - c.start >= MISSAT_MIN_MS ? 'missat' : (c.from === me ? 'avslutat' : 'avbojt'));
+    else samtalSlut(c, 'avslutat');
+    return { state: c.state };
   });
 
   return { refreshThreatLists, threat };
