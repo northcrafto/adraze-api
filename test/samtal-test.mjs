@@ -130,6 +130,28 @@ r = await api(B, 'GET', '/chatt/samtal'); koll('ingen svarar på 30 s → missat
 koll('mejl avstängt → inget mejl till Gamma', !/c@test\.se/.test(logg));
 r = await api(B, 'POST', '/chatt/samtal/ring', { to_id: String(C.id), call_id: s6 }); koll('samma id igen → 409', r.s === 409, r);
 
+// Olästa utan att läsa: klienten räknar själv bort kontrollposter och markerar de inledande som lästa
+for (let i = 0; i < 3; i++) { await api(A, 'POST', '/chatt/messages/send', { to_id: String(B.id), ciphertext: b64(40, 'ABC'[i]) }); await new Promise((ok) => setTimeout(ok, 15)); }
+r = await api(B, 'GET', '/chatt/messages/unread?with=' + A.id);
+koll('unread: tre olästa med chiffertext', r.s === 200 && r.j.messages.length === 3 && r.j.total === 3 && r.j.messages[0].ciphertext.startsWith('A'), r.j);
+r = await api(B, 'GET', '/chatt/messages/overview'); koll('unread: att titta läser inte', r.j.unread.find((u) => u.id === String(A.id))?.n === 3, r.j);
+const mitten = (await api(B, 'GET', '/chatt/messages/unread?with=' + A.id)).j.messages[1].created_at;
+r = await api(B, 'POST', '/chatt/messages/read', { with: String(A.id), until: mitten }); koll('read: markerar bara t.o.m. until', r.j.marked === 2, r);
+r = await api(B, 'GET', '/chatt/messages/overview'); koll('read: en kvar oläst', r.j.unread.find((u) => u.id === String(A.id))?.n === 1, r.j);
+r = await api(A, 'GET', '/chatt/messages?with=' + B.id); koll('read: avsändaren ser läst t.o.m. until', r.j.peer_read_until === mitten, r.j.peer_read_until);
+r = await api(C, 'GET', '/chatt/messages/unread?with=' + A.id); koll('unread: bara kontakter', r.s === 403, r);
+r = await api(B, 'POST', '/chatt/messages/read', { with: String(A.id), until: 'x' }); koll('read: fel indata → 400', r.s === 400, r);
+// Grupp
+r = await api(A, 'POST', '/chatt/groups/create', { name_enc: b64(40), members: [{ user_id: String(A.id), key_envelope: b64(60) }, { user_id: String(B.id), key_envelope: b64(60) }] });
+const ugid = r.j && r.j.id; koll('grupp skapad', !!ugid, r);
+for (let i = 0; i < 2; i++) { await api(A, 'POST', '/chatt/groups/messages', { id: ugid, ciphertext: b64(40, 'XY'[i]) }); await new Promise((ok) => setTimeout(ok, 15)); }
+r = await api(B, 'GET', '/chatt/groups/messages/unread?id=' + encodeURIComponent(ugid));
+koll('grupp unread: två olästa', r.s === 200 && r.j.messages.length === 2 && r.j.total === 2 && r.j.messages[0].sender_username, r.j);
+const g1 = r.j.messages[0].created_at;
+r = await api(B, 'POST', '/chatt/groups/read', { id: ugid, until: g1 }); koll('grupp read: markerar', r.j.marked === 1, r);
+r = await api(B, 'GET', '/chatt/groups'); koll('grupp read: en kvar oläst', r.j.groups.find((g) => g.id === ugid)?.unread === 1, r.j);
+r = await api(C, 'GET', '/chatt/groups/messages/unread?id=' + encodeURIComponent(ugid)); koll('grupp unread: bara medlemmar', r.s === 403, r);
+
 console.log(`\n${ok} ok, ${fel} fel`);
 if (fel) console.log('--- serverlogg ---\n' + logg.slice(-3000));
 stang();

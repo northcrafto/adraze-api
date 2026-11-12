@@ -1111,6 +1111,28 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad: krav
       typing: getPrivacy(withId).typing && isTyping('dm', withId, me) };
   });
 
+  // Olästa utan att läsa dem. Att hämta en konversation (GET /chatt/messages) markerar allt som läst, så klienten kan
+  // annars inte se vad som är oläst. Klienten dekrypterar och räknar själv bort reaktioner och samtalssignaler, och
+  // markerar de inledande sådana posterna som lästa (POST .../read med until). Servern ser fortfarande bara chiffertext.
+  rutt('GET', '/chatt/messages/unread', (req, res) => {
+    const me = profil(req, res).id;
+    const withId = idIn(query(req).get('with') || '');
+    if (!withId) throw E(res, 400, 'missing_with');
+    if (!areContacts(me, withId)) throw E(res, 403, 'not_contacts');
+    const rows = q(`SELECT id, ciphertext, created_at FROM chatt_meddelanden WHERE recipient_id=? AND sender_id=? AND read_at IS NULL AND deleted_at IS NULL
+      ORDER BY created_at DESC LIMIT 200`).all(me, withId).reverse();
+    const n = q('SELECT COUNT(*) c FROM chatt_meddelanden WHERE recipient_id=? AND sender_id=? AND read_at IS NULL').get(me, withId).c;
+    return { messages: rows.map((r) => ({ id: r.id, ciphertext: r.ciphertext, created_at: r.created_at })), total: n };
+  });
+  rutt('POST', '/chatt/messages/read', (req, res, b) => {
+    const me = profil(req, res).id;
+    const withId = idIn(b.with), until = Number(b.until);
+    if (!withId || !Number.isSafeInteger(until) || until <= 0) throw E(res, 400, 'invalid_input');
+    if (!areContacts(me, withId)) throw E(res, 403, 'not_contacts');
+    const r = q('UPDATE chatt_meddelanden SET read_at=? WHERE recipient_id=? AND sender_id=? AND read_at IS NULL AND created_at <= ?').run(now(), me, withId, until);
+    return { marked: Number(r.changes) };
+  });
+
   rutt('GET', '/chatt/messages/overview', (req, res) => {
     const me = profil(req, res).id;
     return { unread: q('SELECT CAST(sender_id AS TEXT) AS id, COUNT(*) AS n FROM chatt_meddelanden WHERE recipient_id=? AND read_at IS NULL GROUP BY sender_id').all(me).map(utRad) };
@@ -1197,6 +1219,27 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad: krav
       JOIN chatt_profiler p ON p.user_id=gm.user_id JOIN users a ON a.id=p.user_id WHERE gm.group_id=? ORDER BY p.username COLLATE NOCASE`).all(gid)
       .map((m) => { const uid = Number(m.id); return { ...m, ...(uid === me || areContacts(me, uid) ? narvaro(jagSyns, uid, m.last_seen) : { online: null, last_seen: null }) }; });
     return { owner_id: g ? idUt(g.owner_id) : null, members };
+  });
+
+  // Som /chatt/messages/unread och /read, för grupper (last_read_at flyttas bara framåt)
+  rutt('GET', '/chatt/groups/messages/unread', (req, res) => {
+    const me = profil(req, res).id;
+    const gid = gidIn(query(req).get('id'));
+    const mem = gid && q('SELECT joined_at, last_read_at FROM chatt_gruppmedlemmar WHERE group_id=? AND user_id=?').get(gid, me);
+    if (!mem) throw E(res, 403, 'not_member');
+    const fran = Math.max(mem.last_read_at, mem.joined_at - 1);
+    const rows = q(`SELECT m.id, m.sender_id, p.username AS sender_username, m.ciphertext, m.created_at FROM chatt_gruppmeddelanden m JOIN chatt_profiler p ON p.user_id=m.sender_id
+      WHERE m.group_id=? AND m.created_at > ? AND m.sender_id != ? AND m.deleted_at IS NULL ORDER BY m.created_at DESC LIMIT 200`).all(gid, fran, me).reverse();
+    const n = q('SELECT COUNT(*) c FROM chatt_gruppmeddelanden WHERE group_id=? AND created_at > ? AND sender_id != ?').get(gid, fran, me).c;
+    return { messages: rows.map((r) => ({ id: r.id, sender_id: idUt(r.sender_id), sender_username: r.sender_username, ciphertext: r.ciphertext, created_at: r.created_at })), total: n };
+  });
+  rutt('POST', '/chatt/groups/read', (req, res, b) => {
+    const me = profil(req, res).id;
+    const gid = gidIn(b.id), until = Number(b.until);
+    if (!gid || !Number.isSafeInteger(until) || until <= 0) throw E(res, 400, 'invalid_input');
+    if (!isMember(gid, me)) throw E(res, 403, 'not_member');
+    const r = q('UPDATE chatt_gruppmedlemmar SET last_read_at=? WHERE group_id=? AND user_id=? AND last_read_at < ?').run(Math.min(until, now()), gid, me, Math.min(until, now()));
+    return { marked: Number(r.changes) };
   });
 
   rutt('GET', '/chatt/groups/messages', (req, res) => {

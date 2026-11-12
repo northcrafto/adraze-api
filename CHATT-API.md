@@ -84,6 +84,8 @@ Ingen hemlig kod längre: servern håller en slumpad hemlighet per konto (32 byt
 | POST | `/chatt/messages/send` | `{to_id, ciphertext (≤16384), attachment_id?}` | `{id, created_at}`; `400 invalid_input/bad_attachment`, `404 user_not_found`, `403 not_contacts` |
 | GET | `/chatt/messages?with=&since=&changed_since=` | – | `{messages:[{id, mine, ciphertext, created_at, deleted, edited}], server_time, changes:[{id, deleted, edited, ciphertext}], peer_read_until, peer_read_at, typing}`; `400 missing_with`, `403 not_contacts` |
 | GET | `/chatt/messages/overview` | – | `{unread:[{id, n}]}` |
+| GET | `/chatt/messages/unread?with=` | – | `{messages:[{id, ciphertext, created_at}], total}`: mina olästa från `with` (högst 200, de senaste), utan att markera dem som lästa; `403 not_contacts` |
+| POST | `/chatt/messages/read` | `{with, until}` | `{marked}`: markerar mina olästa från `with` med `created_at <= until` som lästa; `400 invalid_input`, `403 not_contacts` |
 | POST | `/chatt/messages/edit` | `{id, ciphertext}` | `{}`; `404`, `403 not_sender`, `400 already_deleted` |
 | POST | `/chatt/messages/delete` | `{id}` | `{}`; `404`, `403 not_sender` |
 | POST | `/chatt/messages/hide` | `{id}` | `{}`; `404`, `403 not_participant` |
@@ -109,6 +111,8 @@ Bilagor som laddats upp men aldrig skickats städas efter 6 h. En bilaga kan bar
 | GET | `/chatt/groups` | – | `{groups:[{id, name_enc, owner_id, avatar_enc, key_envelope, wrapped_by, member_count, last_message_at, unread}]}` |
 | GET | `/chatt/groups/members?id=` | – | `{owner_id, members:[{id, username, avatar, joined_at, is_admin, online?, last_seen?}]}` (online-fälten bara för mig själv och mina kontakter); `403 not_member` |
 | GET | `/chatt/groups/messages?id=&since=&changed_since=` | – | `{messages:[{id, sender_id, sender_username, sender_bubble, mine, ciphertext, created_at, deleted, edited}], server_time, reads:[{id, username, read_at}], typing:[username], changes}`; `403 not_member` |
+| GET | `/chatt/groups/messages/unread?id=` | – | `{messages:[{id, sender_id, sender_username, ciphertext, created_at}], total}`: andras olästa (högst 200), läser dem inte; `403 not_member` |
+| POST | `/chatt/groups/read` | `{id, until}` | `{marked}`: flyttar `last_read_at` fram till `until` (aldrig bakåt); `400 invalid_input`, `403 not_member` |
 | POST | `/chatt/groups/messages` | `{id, ciphertext, attachment_id?}` | `{id, created_at}` (`id` i svaret = meddelandets id) |
 | POST | `/chatt/groups/members` | `{id, user_id, key_envelope}` | `{}` eller `{already_member:true}`; `409 group_full`, `403 not_contacts` |
 | POST | `/chatt/groups/rename` | `{id, name_enc}` | `{}`; `403 not_admin` |
@@ -152,6 +156,10 @@ Reaktioner, samtal och skärmdelning skickas som vanliga krypterade meddelanden 
 - `{t:"rx", m:"<meddelande-id>", e:"<emoji>", on:bool}` – reaktion. En post per person, meddelande och emoji; ändras med edit.
 - `{t:"ring", h:"offer"|"answer"|"slut", s:"<samtals-id>", sdp?, o?, d?}` – röstsamtal (o = missat/avbojt/klart/avbrutet, d = sekunder).
 - `{t:"sk", h:"start"|"offer"|"answer"|"slut", s, n?, till?, sdp?}` – visa en flik (skärmdelning), högst 4 tittare.
+
+Olästa: att hämta en konversation markerar allt som läst, och servern kan inte skilja kontrollposter från meddelanden. Klienten
+tittar därför på de olästa med `.../unread`, dekrypterar och räknar bara riktiga meddelanden, missade samtal (`ring slut o:missat`)
+och `sk start`. Kontrollposter som ligger först bland de olästa markeras som lästa med `.../read` och `until`.
 
 ## Finns inte (medvetet)
 
