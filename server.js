@@ -75,6 +75,12 @@ CREATE TABLE IF NOT EXISTS barn_fragor(id INTEGER PRIMARY KEY, barn_id TEXT NOT 
   host TEXT NOT NULL, text TEXT, skapad INTEGER NOT NULL, svar TEXT, minuter INTEGER, svarad INTEGER);
 CREATE INDEX IF NOT EXISTS barn_fragor_barn ON barn_fragor(barn_id, skapad);
 CREATE TABLE IF NOT EXISTS barn_enheter(token TEXT PRIMARY KEY, barn_id TEXT NOT NULL REFERENCES barn(id) ON DELETE CASCADE, skapad INTEGER NOT NULL);`);
+// Spärrljud: föräldern kan välja ett ljud som spelas när barnet hamnar på en spärrad sida (av från början)
+if (!q("SELECT 1 FROM pragma_table_info('barn') WHERE name='sparrljud'").get()) db.exec("ALTER TABLE barn ADD COLUMN sparrljud TEXT NOT NULL DEFAULT ''");
+if (!q("SELECT 1 FROM pragma_table_info('barn') WHERE name='sparrljud_vol'").get()) db.exec('ALTER TABLE barn ADD COLUMN sparrljud_vol INTEGER NOT NULL DEFAULT 60');
+const SPARRLJUD = ['', 'hangd', 'summer', 'stotar', 'kort', 'stotar-kort'];
+const ljudUt = (c) => ({ id: SPARRLJUD.includes(c.sparrljud) ? c.sparrljud : '', volym: Math.min(80, Math.max(10, c.sparrljud_vol | 0)) });
+
 
 // ---------- hjälpare ----------
 const now = () => Date.now();
@@ -651,7 +657,7 @@ rutt('POST', '/barn/verifiera', async (req, res, b) => {
 
 rutt('POST', '/barn/jag', (req) => {
   const c = barnInloggad(req);
-  return { namn: c.namn, alder: c.alder, blocklista: lasLista(c.blocklista), tillat: aktivaTillat(c.tillat),
+  return { namn: c.namn, alder: c.alder, blocklista: lasLista(c.blocklista), tillat: aktivaTillat(c.tillat), sparrljud: ljudUt(c),
     fragor: q('SELECT id, host, skapad, svar, minuter, svarad FROM barn_fragor WHERE barn_id=? AND skapad>? ORDER BY skapad DESC LIMIT 20').all(c.id, now() - 86_400_000) };
 });
 // Barnets dator får en egen märkning som finns kvar när barnet loggar ut. Loggar någon sedan in med ett ANNAT
@@ -726,7 +732,7 @@ rutt('POST', '/familj/lista', (req) => {
   const antal = q('SELECT COUNT(*) AS n FROM barn_sessioner WHERE barn_id=? AND expires>?');
   return { barn: q('SELECT * FROM barn WHERE foralder_id=? ORDER BY skapad').all(u.id).map((c) => ({
     id: c.id, namn: c.namn, alder: c.alder, kod: c.kod, blocklista: lasLista(c.blocklista), tillat: aktivaTillat(c.tillat),
-    senast: c.senast || 0, inloggningar: antal.get(c.id, now()).n,
+    senast: c.senast || 0, inloggningar: antal.get(c.id, now()).n, sparrljud: ljudUt(c),
     fragor: q('SELECT id, host, text, skapad FROM barn_fragor WHERE barn_id=? AND svar IS NULL AND skapad>? ORDER BY skapad DESC LIMIT 20').all(c.id, now() - 7 * 86_400_000) })) };
 });
 // Föräldern svarar på barnets fråga: ja (i X minuter, eller 0 = alltid) eller nej
@@ -751,6 +757,14 @@ rutt('POST', '/familj/blocklista', (req, res, b) => {
   const lista = Array.isArray(b.blocklista) ? b.blocklista.slice(0, 500).map((x) => String(x).slice(0, 120)) : [];
   q('UPDATE barn SET blocklista=? WHERE id=?').run(JSON.stringify(lista), c.id);
   return {};
+});
+rutt('POST', '/familj/sparrljud', (req, res, b) => {
+  const c = ettBarn(kravInloggad(req), b.barn_id);
+  const id = String(b.ljud || '');
+  if (!SPARRLJUD.includes(id)) throw fel(400, 'Okänt ljud.');
+  const vol = parseInt(b.volym, 10);
+  q('UPDATE barn SET sparrljud=?, sparrljud_vol=? WHERE id=?').run(id, Math.min(80, Math.max(10, Number.isFinite(vol) ? vol : 60)), c.id);
+  return { sparrljud: ljudUt(q('SELECT * FROM barn WHERE id=?').get(c.id)) };
 });
 rutt('POST', '/familj/tillat', (req, res, b) => {
   const c = ettBarn(kravInloggad(req), b.barn_id);
