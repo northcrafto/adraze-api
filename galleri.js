@@ -166,7 +166,9 @@ module.exports = function registreraGalleri({ rutt, q, db, fel, inloggad, kravIn
     const u = inloggad(req);
     if (u) return { typ: 'vuxen', id: u.id, nyckel: 'u:' + u.id };
     if (!/^Bearer /.test(String(req.headers.authorization || ''))) return null;
-    try { const c = barnInloggad(req); return { typ: 'barn', id: c.id, nyckel: 'b:' + c.id }; } catch { return null; }
+    // Barn räknas som sin förälder för röster, anmälningar och nedladdningar, så att en person inte kan stapla
+    // dem genom att skapa flera barnkonton (ett hushåll = en röst/anmälan).
+    try { const c = barnInloggad(req); return { typ: 'barn', id: c.id, nyckel: 'u:' + c.foralder_id }; } catch { return null; }
   }
   function kravKonto(req, text) { const v = vemAr(req); if (!v) throw fel(401, text); return v; }
   const egen = (t, vem) => !!(vem && vem.typ === 'vuxen' && vem.id === t.agare);

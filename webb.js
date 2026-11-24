@@ -38,7 +38,7 @@ function safeLookup(host, opts, cb) {
     cb(null, ok[0].address, ok[0].family);
   });
 }
-function safeGet(urlStr, maxBytes, hops = 0) {
+function safeGet(urlStr, maxBytes, hops = 0, deadline = Date.now() + 10_000) {
   return new Promise((resolve, reject) => {
     let u; try { u = new URL(urlStr); } catch { return reject(new Error('bad_url')); }
     if (!/^https?:$/.test(u.protocol)) return reject(new Error('bad_proto'));
@@ -54,7 +54,7 @@ function safeGet(urlStr, maxBytes, hops = 0) {
         svar.resume();
         if (hops >= 4) return reject(new Error('too_many_redirects'));
         let nx; try { nx = new URL(svar.headers.location, u).href; } catch { return reject(new Error('bad_redirect')); }
-        return safeGet(nx, maxBytes, hops + 1).then(resolve, reject);
+        return safeGet(nx, maxBytes, hops + 1, deadline).then(resolve, reject);
       }
       if (svar.statusCode !== 200) { svar.resume(); return reject(new Error('status_' + svar.statusCode)); }
       const chunks = []; let n = 0;
@@ -62,6 +62,9 @@ function safeGet(urlStr, maxBytes, hops = 0) {
       svar.on('close', () => resolve({ url: u.href, type: String(svar.headers['content-type'] || '').toLowerCase(), body: Buffer.concat(chunks).subarray(0, maxBytes) }));
       svar.on('error', reject);
     });
+    // Total tidsgräns (inte bara tomgång på socketen): en sida som droppar fram data i evighet får inte låsa Falk
+    const totalTimer = setTimeout(() => r.destroy(new Error('timeout')), Math.max(0, deadline - Date.now()));
+    r.on('close', () => clearTimeout(totalTimer));
     r.on('timeout', () => r.destroy(new Error('timeout')));
     r.on('error', reject);
     r.end();

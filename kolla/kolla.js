@@ -12,9 +12,34 @@ const os = require('node:os');
 const path = require('node:path');
 const { chromium } = require('playwright-core');
 
+const bluff = require('./bluff');
 const DIR = __dirname;
 const PORT = Number(process.env.KOLLA_PORT || 8493);
-const EXE = process.env.CHROME || path.join(os.homedir(), '.cache/ms-playwright/chromium-1234/chrome-linux64/chrome');
+// Chromium-binären: hitta nyaste installerade bygget i stället för att hårdkoda ett versionsnummer,
+// och varna högt om den är för gammal (en gammal renderare kan ha orättade buggar även med sandlåda).
+const CHROME_MAX_ALDER_DAGAR = Number(process.env.CHROME_MAX_ALDER_DAGAR || 120);
+function valjChrome() {
+  if (process.env.CHROME) return process.env.CHROME;
+  const basmapp = path.join(os.homedir(), '.cache/ms-playwright');
+  let vald = null;
+  let hogst = -1;
+  try {
+    for (const namn of fs.readdirSync(basmapp)) {
+      const m = /^chromium(?:_headless_shell)?-(\d+)$/.exec(namn);
+      if (!m) continue;
+      const n = Number(m[1]);
+      const exe = path.join(basmapp, namn, 'chrome-linux64', 'chrome');
+      if (n > hogst && fs.existsSync(exe)) { hogst = n; vald = exe; }
+    }
+  } catch {}
+  if (!vald) { console.error('kolla: hittar ingen installerad chromium-binär under', basmapp); return path.join(basmapp, 'chromium/chrome-linux64/chrome'); }
+  try {
+    const alderDagar = (Date.now() - fs.statSync(vald).mtimeMs) / 86_400_000;
+    if (alderDagar > CHROME_MAX_ALDER_DAGAR) console.error(`kolla: VARNING chromium-binären är ~${Math.round(alderDagar)} dagar gammal (${vald}); uppdatera den, en gammal renderare kan ha orättade buggar`);
+  } catch {}
+  return vald;
+}
+const EXE = valjChrome();
 const TILLAGG = path.join(DIR, 'extension');
 const RESULTAT = path.join(DIR, 'resultat');
 const SAMTIDIGA = 2; // skanningar åt gången (varje skanning = två webbläsare efter varandra)
@@ -254,7 +279,8 @@ async function klickaGodkann(sida) {
   for (let forsok = 0; forsok < 2; forsok++) {
     for (const ram of sida.frames()) {
       try {
-        const traff = await ram.evaluate(([ja, nej, alla]) => {
+        const traff = await Promise.race([
+          ram.evaluate(([ja, nej, alla]) => {
           const [JA, NEJ, ALLA] = [ja, nej, alla].map((k) => new RegExp(k, 'i'));
           const text = (el) => (el.innerText || el.value || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
           const synlig = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden'; };
@@ -263,7 +289,9 @@ async function klickaGodkann(sida) {
           const k = kandidater.find((el) => ALLA.test(text(el))) || kandidater[0];
           if (k) { k.click(); return true; }
           return false;
-        }, [GODKANN.source, NEJ.source, ALLA.source]);
+          }, [GODKANN.source, NEJ.source, ALLA.source]),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('evaluate-tidsgräns')), 5000)),
+        ]);
         if (traff) return true;
       } catch {}
     }
@@ -280,9 +308,10 @@ async function korWebblasare(adress, medAdraze, sidhost) {
     '--force-webrtc-ip-handling-policy=disable_non_proxied_udp', '--webrtc-ip-handling-policy=disable_non_proxied_udp'];
   if (medAdraze) args.push(`--disable-extensions-except=${TILLAGG}`, `--load-extension=${TILLAGG}`);
   let ctx;
-  try {
+  let tidsur;
+  const arbete = (async () => {
     ctx = await chromium.launchPersistentContext(profil, {
-      executablePath: EXE, headless: false, args, viewport: { width: 1280, height: 800 }, locale: 'sv-SE', timezoneId: 'Europe/Stockholm',
+      executablePath: EXE, headless: false, args, chromiumSandbox: true, viewport: { width: 1280, height: 800 }, locale: 'sv-SE', timezoneId: 'Europe/Stockholm',
       acceptDownloads: false, ignoreDefaultArgs: ['--disable-extensions'],
       userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
     });
@@ -346,7 +375,14 @@ async function korWebblasare(adress, medAdraze, sidhost) {
       laddtid, bytes, perTyp, forfragningar: forfr.size, blockerade, kakor, popups, godkande, tredjeparter: tredjeVardar.size,
       ...raknat, exempel: { reklam: [...exempel.reklam], sparare: [...exempel.sparare] }, slutadress: sida.url(), bild,
     };
+  })();
+  arbete.catch(() => {}); // undvik unhandledRejection om vakten vinner kapplöpningen
+  // Total tidsgräns: en elak sida kan annars låsa en skanningsplats och bränna en kärna för alltid
+  const vakt = new Promise((_, rej) => { tidsur = setTimeout(() => { ctx?.close().catch(() => {}); rej(Object.assign(new Error('tidsgräns'), { kod: 'tidsgrans' })); }, 90_000); });
+  try {
+    return await Promise.race([arbete, vakt]);
   } finally {
+    clearTimeout(tidsur);
     await ctx?.close().catch(() => {});
     fs.rmSync(profil, { recursive: true, force: true });
   }
@@ -448,6 +484,22 @@ function stadaAdress(text) {
 }
 
 // ---------- gränser ----------
+// IPv6: hinka per /64 så att en klient med ett helt /64 inte kan byta adress för varje förfrågan och kringgå gränserna
+function ipv6Prefix(ip, grupper) {
+  ip = ip.split('%')[0];
+  const delar = ip.split('::');
+  const huvud = delar[0] ? delar[0].split(':') : [];
+  const svans = delar.length > 1 && delar[1] ? delar[1].split(':') : [];
+  const saknas = Math.max(0, 8 - huvud.length - svans.length);
+  const full = [...huvud, ...Array(saknas).fill('0'), ...svans];
+  return full.slice(0, grupper).map((h) => (parseInt(h || '0', 16) || 0).toString(16)).join(':');
+}
+function ipHink(ip) {
+  if (!net.isIPv6(ip)) return ip;
+  const m = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(ip);
+  if (m) return m[1];
+  return ipv6Prefix(ip, 4) + '::/64';
+}
 const traffar = new Map();
 function begransad(nyckel, max, fonsterMs) {
   const t = Date.now();
@@ -465,18 +517,18 @@ function skicka(res, status, kropp) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
   res.end(JSON.stringify(kropp));
 }
-function lasJson(req) {
+function lasJson(req, max = 8192) {
   return new Promise((resolve) => {
     let n = 0; const bitar = [];
-    req.on('data', (c) => { n += c.length; if (n <= 8192) bitar.push(c); });
-    req.on('end', () => { try { resolve(n > 8192 ? null : JSON.parse(Buffer.concat(bitar).toString('utf8') || '{}')); } catch { resolve(null); } });
+    req.on('data', (c) => { n += c.length; if (n <= max) bitar.push(c); });
+    req.on('end', () => { try { resolve(n > max ? null : JSON.parse(Buffer.concat(bitar).toString('utf8') || '{}')); } catch { resolve(null); } });
     req.on('error', () => resolve(null));
   });
 }
 
 http.createServer(async (req, res) => {
   const sokvag = new URL(req.url, 'http://x').pathname;
-  const ip = String(req.headers['cf-connecting-ip'] || req.socket.remoteAddress);
+  const ip = ipHink(String(req.headers['cf-connecting-ip'] || req.socket.remoteAddress));
   try {
     if (req.method === 'POST' && sokvag === '/kolla') {
       const b = await lasJson(req);
@@ -492,6 +544,14 @@ http.createServer(async (req, res) => {
       jobb.set(j.id, j); senaste.set(adress, j.id); ko.push(j.id);
       nasta();
       return skicka(res, 200, { ok: true, id: j.id });
+    }
+    // Bluffkollen: text in, bedömning ut. Texten sparas inte och skrivs aldrig i loggen.
+    if (req.method === 'POST' && sokvag === '/kolla/bluff') {
+      const b = await lasJson(req, 32_768);
+      const text = typeof b?.text === 'string' ? b.text.trim() : '';
+      if (!text || text.length > 6000) return skicka(res, 400, { ok: false, fel: text ? 'for_lang' : 'tom' });
+      if (begransad(`bm:${ip}`, 15, 10 * 60_000) || begransad(`bd:${ip}`, 150, 86_400_000)) return skicka(res, 429, { ok: false, fel: 'for_manga' });
+      return skicka(res, 200, await bluff.analysera(text, { kollaMotorer, publikAdress, bas }));
     }
     let m;
     if (req.method === 'GET' && (m = /^\/kolla\/r\/([a-z0-9]+)$/.exec(sokvag))) {

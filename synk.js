@@ -17,6 +17,9 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
 
   const SORTER = { bokmarken: 'url', kortkommandon: 'id' };
   const MAX = 5000;             // tak per sort så en trasig klient inte sväller valvet
+  const MAX_GRAVAR = 5000;      // tak på gravstenar så de inte kan svälla raden obegränsat
+  const MAX_POST = 16_384;      // tak på en enskild posts serialiserade storlek
+  const MAX_RAD = 1_000_000;    // tak på hela radens serialiserade storlek (1 MB) innan den skrivs
 
   // En rad som är äldre än kontot blev kvar efter ett raderat konto med samma id och räknas som tom
   function las(u, sorts) {
@@ -43,18 +46,18 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
   rutt('POST', '/synk/get', async (req, res, b) => {
     const u = kravInloggad(req);
     const sorts = String((b && b.sorts) || '');
-    if (!SORTER[sorts]) throw fel(400, 'Okänd sort.');
+    if (!Object.hasOwn(SORTER, sorts)) throw fel(400, 'Okänd sort.');
     const state = las(u, sorts);
     return { rev: state.rev, poster: utatt(state) };
   });
 
   // Skicka upp lokala ändringar och få tillbaka den sammanfogade listan
-  rutt.max('/synk/push', 2_000_000);
+  rutt.max('/synk/push', 1_000_000);
   rutt('POST', '/synk/push', async (req, res, b) => {
     const u = kravInloggad(req);
     const sorts = String((b && b.sorts) || '');
+    if (!Object.hasOwn(SORTER, sorts)) throw fel(400, 'Okänd sort.');
     const nyckel = SORTER[sorts];
-    if (!nyckel) throw fel(400, 'Okänd sort.');
     if (begransad(`synk:${u.id}`, 120, 3_600_000)) throw fel(429, 'För många försök. Vänta en stund.');
 
     const state = las(u, sorts);
@@ -72,6 +75,7 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
     // Poster: lägg till/uppdatera om den inte tagits bort senare
     for (const p of poster) {
       const k = p && p[nyckel]; if (!k || typeof k !== 'string') continue;
+      if (JSON.stringify(p).length > MAX_POST) continue;                 // hoppa över orimligt stora poster
       const t = Number(p._t) || nu;
       if (state.borttagna[k] && state.borttagna[k] >= t) continue;      // borttagen senare → hoppa
       if (state.borttagna[k]) delete state.borttagna[k];                 // återuppstånden
@@ -86,6 +90,12 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
     }
     // Städa gamla gravstenar (äldre än 90 dygn)
     for (const k of Object.keys(state.borttagna)) if (state.borttagna[k] < nu - 90 * 86_400_000) delete state.borttagna[k];
+    // Håll även antalet gravstenar inom taket (behåll de nyaste)
+    if (Object.keys(state.borttagna).length > MAX_GRAVAR) {
+      state.borttagna = Object.fromEntries(Object.entries(state.borttagna).sort((a, c) => c[1] - a[1]).slice(0, MAX_GRAVAR));
+    }
+    // Sista skydd: vägra skriva en rad som ändå blir för stor
+    if (JSON.stringify({ poster: state.poster, borttagna: state.borttagna }).length > MAX_RAD) throw fel(413, 'För mycket data.');
 
     const rev = skriv(u.id, sorts, state);
     return { rev, poster: utatt(state) };

@@ -5,7 +5,8 @@
 const webb = require('./webb.js');
 const fs = require('node:fs'), path = require('node:path');
 
-module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
+module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now, ipAv }) => {
+  const ip = (req) => (ipAv ? ipAv(req) : 'okand');
   const KEY = process.env.STRIPE_SECRET_KEY || '';
   const PK = process.env.STRIPE_PUBLISHABLE_KEY || '';
   const AI_BASE = process.env.AI_CHAT_BASE || '';
@@ -32,9 +33,13 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
   function kvotRad(u, planNamn) {
     const k = KVOT[planNamn];
     let r = q('SELECT * FROM falk_kvot WHERE user_id=?').get(u.id);
-    if (!r || r.plan !== planNamn || now() - r.start >= k.period) {
+    if (!r || now() - r.start >= k.period) {
       r = { user_id: u.id, plan: planNamn, start: now(), tokens: 0, sokfragor: 0 };
       q('INSERT INTO falk_kvot(user_id,plan,start,tokens,sokfragor) VALUES(?,?,?,0,0) ON CONFLICT(user_id) DO UPDATE SET plan=excluded.plan, start=excluded.start, tokens=0, sokfragor=0').run(u.id, planNamn, r.start);
+    } else if (r.plan !== planNamn) {
+      // Byt plan men behåll start och tokens: ett planbyte får inte nollställa kvoten (annars kan den nollas godtyckligt)
+      q('UPDATE falk_kvot SET plan=? WHERE user_id=?').run(planNamn, u.id);
+      r.plan = planNamn;
     }
     return r;
   }
@@ -68,7 +73,7 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
   const uppskatta = (msgs) => Math.ceil(msgs.reduce((a, m) => a + String(m.content || '').length + (m.tool_calls ? JSON.stringify(m.tool_calls).length : 0), 0) / 3);
   const pagar = new Set();   // en fråga i taget per konto
 
-  for (const [kol, typ] of [['stripe_customer', 'TEXT'], ['pro_sub', 'TEXT'], ['pro_until', 'INTEGER']]) {
+  for (const [kol, typ] of [['stripe_customer', 'TEXT'], ['pro_sub', 'TEXT'], ['pro_until', 'INTEGER'], ['pro_gift_until', 'INTEGER']]) {
     if (!q(`SELECT 1 FROM pragma_table_info('users') WHERE name='${kol}'`).get()) db.exec(`ALTER TABLE users ADD COLUMN ${kol} ${typ}`);
   }
 
@@ -105,7 +110,9 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
     return (prisCache[plan] = pris);
   }
 
-  const arPro = (u) => !!(u.pro_until && u.pro_until > now());
+  // Pro gäller om prenumerationen ELLER en inlöst gåva (egen kolumn) räcker, det senaste av de två datumen
+  const proTill = (u) => Math.max(Number(u.pro_until) || 0, Number(u.pro_gift_until) || 0);
+  const arPro = (u) => proTill(u) > now();
 
   // Black Friday: 20 procent på första månaden (gäller bara månadsplanen, fram till kampanjens slut).
   const BF_SLUT = Date.parse('2026-12-03T00:00:00Z');
@@ -125,11 +132,20 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
   const laggManader = (frMs, man) => { const d = new Date(frMs); d.setUTCMonth(d.getUTCMonth() + man); return d.getTime(); };
   const hittaKonto = (email) => q('SELECT * FROM users WHERE lower(email)=lower(?)').get(String(email || '').trim());
 
+  // En väntande kundskapning per användare, så att två samtidiga anrop inte skapar två Stripe-kunder (dubbeldebitering)
+  const kundPagar = new Map();
   async function kundFor(u) {
     if (u.stripe_customer) return u.stripe_customer;
-    const k = await stripe('POST', 'customers', { email: u.email, 'metadata[adraze_user]': String(u.id) });
-    q('UPDATE users SET stripe_customer=? WHERE id=?').run(k.id, u.id);
-    return k.id;
+    if (kundPagar.has(u.id)) return kundPagar.get(u.id);
+    const p = (async () => {
+      const r = q('SELECT stripe_customer FROM users WHERE id=?').get(u.id);
+      if (r?.stripe_customer) return r.stripe_customer;
+      const k = await stripe('POST', 'customers', { email: u.email, 'metadata[adraze_user]': String(u.id) });
+      q('UPDATE users SET stripe_customer=? WHERE id=?').run(k.id, u.id);
+      return k.id;
+    })();
+    kundPagar.set(u.id, p);
+    try { return await p; } finally { kundPagar.delete(u.id); }
   }
 
   // Läser prenumerationen från Stripe och sparar hur länge Pro gäller.
@@ -141,6 +157,8 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
     const aterbetald = !!(ch && typeof ch === 'object' && (ch.refunded || ch.disputed));
     const aktiv = (s.status === 'active' || s.status === 'trialing') && !aterbetald;
     const tills = aktiv ? s.current_period_end * 1000 + 3_600_000 : null;   // en timmes marginal för förnyelsen
+    // Skriv inte över en redan aktiv prenumeration med en annan som inte är aktiv (annars kan en död prenumeration ta över kontot)
+    if (!aktiv && u.pro_sub && u.pro_sub !== s.id && u.pro_until && u.pro_until > now()) return { aktiv: false, tills: u.pro_until, slutar: false };
     q('UPDATE users SET pro_sub=?, pro_until=? WHERE id=?').run(s.id, tills, u.id);
     return { aktiv, tills, slutar: !!s.cancel_at_period_end };
   }
@@ -163,6 +181,15 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
     if (!PLANER[b.plan]) throw fel(400, 'Okänd plan.');
     if (begransad(`pro:${u.id}`, 20, 3_600_000)) throw fel(429, 'För många försök. Vänta en stund.');
     const [pris, kund] = await Promise.all([prisFor(b.plan), kundFor(u)]);
+    // Finns redan en prenumeration som gäller eller väntar på betalning: bokför/återanvänd den i stället för att skapa en ny
+    const fin = await stripe('GET', `subscriptions?customer=${kund}&status=all&limit=10&expand[]=data.latest_invoice.payment_intent`);
+    const redan = (fin.data || []).find((s) => ['active', 'trialing', 'past_due'].includes(s.status));
+    if (redan) {
+      await lasPrenumeration(u, redan.id).catch(() => {});
+      if (redan.status === 'active' || redan.status === 'trialing') throw Object.assign(fel(409, 'Du har redan Pro.'), { kropp: { ok: false, error: 'already_pro', message: 'Du har redan Pro på det här kontot.' } });
+      const pi0 = redan.latest_invoice?.payment_intent;
+      if (pi0?.client_secret) return { client_secret: pi0.client_secret, publishable_key: PK, amount: pi0.amount, currency: pi0.currency, kind: 'subscription', interval: PLANER[b.plan].intervall, subscription: redan.id };
+    }
     // Gamla ofullbordade försök städas, så kunden inte får flera obetalda prenumerationer
     const gamla = await stripe('GET', `subscriptions?customer=${kund}&status=incomplete&limit=10`);
     await Promise.all((gamla.data || []).map((s) => stripe('DELETE', `subscriptions/${s.id}`).catch(() => {})));
@@ -180,6 +207,7 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
 
   rutt('POST', '/pro/confirm', async (req, res, b) => {
     const u = kravInloggad(req);
+    if (begransad(`pro-confirm:${u.id}`, 10, 600_000)) throw fel(429, 'För många försök. Vänta en stund.');
     if (!/^sub_[A-Za-z0-9]{8,64}$/.test(b.subscription || '')) throw fel(400, 'Okänd prenumeration.');
     if (!u.stripe_customer) throw fel(400, 'Okänd prenumeration.');
     // Stripe kan behöva en kort stund på sig efter kortbetalningen
@@ -198,7 +226,8 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
     const email = String(b.email || '').trim();
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw fel(400, 'Skriv en giltig mejladress.');
     const m = hittaKonto(email);
-    return { found: !!m, namn: m ? (m.namn || '') : '', email };
+    // Avslöja inte namnet och bara att verifierade konton finns (underlag för riktat nätfiske annars)
+    return { found: !!(m && m.verified), email };
   });
 
   // Givaren betalar en gåvoperiod (engångsbetalning). Mottagaren och antalet månader låses i betalningens metadata.
@@ -209,9 +238,10 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
     if (!man) throw fel(400, 'Okänd gåvoperiod.');
     const email = String(b.email || '').trim();
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw fel(400, 'Skriv en giltig mejladress.');
+    // Räkna spärren före uppslaget, så att 404 inte blir ett snabbt uppräkningsorakel för vilka konton som finns
+    if (begransad(`gift:${u.id}`, 20, 3_600_000) || begransad(`gift-ip:${ip(req)}`, 60, 3_600_000)) throw fel(429, 'För många försök. Vänta en stund.');
     const mottagare = hittaKonto(email);
     if (!mottagare) throw fel(404, 'Det finns inget AdRaze-konto med den mejladressen. Be mottagaren skapa ett konto först.');
-    if (begransad(`gift:${u.id}`, 20, 3_600_000)) throw fel(429, 'För många försök. Vänta en stund.');
     const belopp = man * 7900;
     const pi = await stripe('POST', 'payment_intents', {
       amount: String(belopp), currency: 'sek', 'payment_method_types[0]': 'card', description: `AdRaze Pro, gåva ${man} mån`,
@@ -226,23 +256,29 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
   // Efter betalningen: kontrollera att den gick igenom och lägg perioden på mottagarens konto. Engångs, kan inte lösas in två gånger.
   rutt('POST', '/pro/gift/confirm', async (req, res, b) => {
     const u = kravInloggad(req);
+    if (begransad(`gift-confirm:${u.id}`, 10, 600_000)) throw fel(429, 'För många försök. Vänta en stund.');
     const id = String(b.payment_intent || '');
     if (!/^pi_[A-Za-z0-9]{8,64}$/.test(id)) throw fel(400, 'Okänd betalning.');
-    const pi = await stripe('GET', `payment_intents/${encodeURIComponent(id)}`);
+    const pi = await stripe('GET', `payment_intents/${encodeURIComponent(id)}?expand[]=latest_charge`);
     if (pi.metadata?.app !== 'adraze-gift' || pi.metadata?.gett_av !== String(u.id)) throw fel(400, 'Okänd betalning.');
     if (pi.status !== 'succeeded') return { klar: false, status: pi.status };
+    // Återbetald eller bestridd betalning levererar ingen gåva
+    const ch = pi.latest_charge && typeof pi.latest_charge === 'object' ? pi.latest_charge : null;
+    if (ch && (ch.refunded || ch.disputed)) return { klar: false, status: 'refunded' };
     const man = GAVA_MAN[Number(pi.metadata.manader)] || 0;
     const mottagare = q('SELECT * FROM users WHERE id=?').get(Number(pi.metadata.till_user));
     if (!man || !mottagare) throw fel(400, 'Okänd betalning.');
     // Lös in en gång: första confirm vinner, resten ser att den redan är inlöst.
-    const forst = db.transaction(() => {
-      if (q('SELECT 1 FROM pro_gaver WHERE pi=?').get(id)) return false;
+    // node:sqlite saknar db.transaction, så BEGIN IMMEDIATE/COMMIT/ROLLBACK (som i server.js).
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      if (q('SELECT 1 FROM pro_gaver WHERE pi=?').get(id)) { db.exec('COMMIT'); return { klar: true, redan: true, till: mottagare.email, manader: man }; }
       q('INSERT INTO pro_gaver(pi,redeemed,gett_av,till_email,manader) VALUES(?,?,?,?,?)').run(id, now(), u.id, mottagare.email, man);
-      const until = laggManader(Math.max(now(), mottagare.pro_until || 0), man) + 3_600_000;
-      q('UPDATE users SET pro_until=? WHERE id=?').run(until, mottagare.id);
-      return until;
-    })();
-    if (forst === false) return { klar: true, redan: true, till: mottagare.email, manader: man };
+      // Gåvans slutdatum i egen kolumn, så att prenumerationens pro_until inte skriver över den (och tvärtom)
+      const until = laggManader(Math.max(now(), Number(mottagare.pro_gift_until) || 0), man) + 3_600_000;
+      q('UPDATE users SET pro_gift_until=? WHERE id=?').run(until, mottagare.id);
+      db.exec('COMMIT');
+    } catch (e) { try { db.exec('ROLLBACK'); } catch {} throw e; }
     return { klar: true, till: mottagare.email, namn: mottagare.namn || '', manader: man };
   });
 
@@ -263,6 +299,7 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
   // Status för inställningarna: hur länge Pro gäller och om prenumerationen är uppsagd
   rutt('GET', '/pro/status', async (req) => {
     const u = await uppdatera(kravInloggad(req));
+    if (begransad(`pro-status:${u.id}`, 20, 600_000)) throw fel(429, 'För många försök. Vänta en stund.');
     const svar = { pro: arPro(u), until: u.pro_until || null, prenumeration: null };
     if (KEY && u.pro_sub) {
       try {
@@ -280,6 +317,7 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
   // Säg upp: Pro gäller perioden ut och förnyas sedan inte
   rutt('POST', '/pro/cancel', async (req) => {
     const u = kravInloggad(req);
+    if (begransad(`pro-cancel:${u.id}`, 10, 600_000)) throw fel(429, 'För många försök. Vänta en stund.');
     if (!u.pro_sub) throw fel(400, 'Du har ingen prenumeration.');
     const nu = await stripe('GET', `subscriptions/${encodeURIComponent(u.pro_sub)}`);
     if (nu.customer !== u.stripe_customer) throw fel(400, 'Okänd prenumeration.');
@@ -291,6 +329,7 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
   // Ångra uppsägningen innan perioden gått ut
   rutt('POST', '/pro/resume', async (req) => {
     const u = kravInloggad(req);
+    if (begransad(`pro-resume:${u.id}`, 10, 600_000)) throw fel(429, 'För många försök. Vänta en stund.');
     if (!u.pro_sub) throw fel(400, 'Du har ingen prenumeration.');
     const nu = await stripe('GET', `subscriptions/${encodeURIComponent(u.pro_sub)}`);
     if (nu.customer !== u.stripe_customer) throw fel(400, 'Okänd prenumeration.');
@@ -304,7 +343,7 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
     const u = await uppdatera(kravInloggad(req));
     return { kvot: kvotUt(kvotRad(u, arPro(u) ? 'pro' : 'gratis')) };
   });
-  rutt.max('/falk/chat', 1_400_000);   // bifogade filer/mappar och projektfiler (klienten håller sig under ~60k + 100k tecken)
+  rutt.max('/falk/chat', 500_000);   // bifogade filer/mappar och projektfiler (klienten håller sig under ~60k + 100k tecken)
   rutt('POST', '/falk/chat', async (req, res, b) => {
     const u = await uppdatera(kravInloggad(req));
     if (!AI_BASE || !AI_KEY) throw fel(503, 'Falk är inte igång just nu.');
@@ -323,12 +362,13 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
         : 'Du har använt gratiskvoten för Falk. Den fylls på ' + new Date(kv.start + k.period).toLocaleDateString('sv-SE') + ', eller skaffa Pro för mycket mer.' } });
     if (kv.tokens >= k.tokens) throw kvotFel();
     if (dagTokens() >= DAG_TAK) { console.error('Falk: dygnstaket nått', dagTokens()); throw fel(503, 'Falk har väldigt mycket att göra just nu. Försök igen senare.'); }
-    if (begransad('falk:alla', MINUT_TAK, 60_000)) throw fel(503, 'Falk har väldigt mycket att göra just nu. Försök igen om en minut.');
     if (begransad(`falk:${u.id}`, k.perDygn, DAG)) throw fel(429, 'Du har ställt väldigt många frågor i dag. Försök igen i morgon.');
     const msgs = (Array.isArray(b.messages) ? b.messages : []).slice(-16)
-      .filter((m) => m && ['user', 'assistant', 'system'].includes(m.role) && typeof m.content === 'string')
+      .filter((m) => m && ['user', 'assistant'].includes(m.role) && typeof m.content === 'string')   // ta inte emot rollen system från klienten
       .map((m) => ({ role: m.role, content: m.content.slice(0, 120_000) }));
     if (!msgs.length) throw fel(400, 'Skriv en fråga.');
+    // Global minutgräns sist, efter meddelande- och kontogränsen: annars kan ett konto med tomma anrop stänga Falk för alla gratis
+    if (begransad('falk:alla', MINUT_TAK, 60_000)) throw fel(503, 'Falk har väldigt mycket att göra just nu. Försök igen om en minut.');
     // Totalt tak: blir det för mycket kortas de äldsta meddelandena först (instruktionerna först i listan och din senaste fråga behålls)
     let tot = msgs.reduce((a, m) => a + m.content.length, 0);
     for (let i = 2; tot > k.maxTecken && i < msgs.length - 1; i++) { tot -= msgs[i].content.length; msgs[i].content = msgs[i].content.slice(0, 2000) + '\n…(äldre meddelande kortat)'; tot += msgs[i].content.length; }
@@ -349,8 +389,9 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
         body: JSON.stringify({ model: modell, messages: msgs, max_tokens: maxSvar, temperature: 0.4, reasoning_effort: 'none', tools: verktyg, tool_choice: sista ? 'none' : 'auto' }),
       }).catch(() => null);
       const d = r ? await r.json().catch(() => ({})) : {};
-      // Räkna det som faktiskt användes (saknas siffran: uppskatta från texten)
-      raknaTokens(kv, Number(d.usage?.total_tokens) || (r?.ok ? uppskatta(msgs) + Math.ceil(String(d.choices?.[0]?.message?.content || '').length / 3) : 0), r?.ok ? lageTokens : 0);
+      // Räkna det som faktiskt användes (saknas siffran: uppskatta från texten).
+      // Lägets prompt är gratis bara för Pro; gratiskonton debiteras den, annars kostar ett gratiskonto ~10x sin kvot.
+      raknaTokens(kv, Number(d.usage?.total_tokens) || (r?.ok ? uppskatta(msgs) + Math.ceil(String(d.choices?.[0]?.message?.content || '').length / 3) : 0), r?.ok && planNamn === 'pro' ? lageTokens : 0);
       const m = d.choices?.[0]?.message;
       if (!r?.ok || !m) { console.error('Falk', r?.status, d.error?.message); break; }
       // Ibland skickar leverantören DeepSeeks råa verktygssyntax som text i stället för tool_calls
@@ -369,7 +410,9 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
         return { reply: (m.content || '').trim(), actions, sources: [], kvot: kvotUt(kv), modell: modellNyckel };
       }
       msgs.push({ role: 'assistant', content: m.content || '', tool_calls: anrop });
-      const utfall = await Promise.all(anrop.map(async (a) => {
+      const verktygsSlut = Math.max(1000, slut - Date.now());
+      const utfall = await Promise.race([
+        Promise.all(anrop.map(async (a) => {
         let arg = {}; try { arg = JSON.parse(a.function?.arguments || '{}'); } catch {}
         try {
           const webbVerktyg = a.function?.name === 'web_search' || a.function?.name === 'read_page';
@@ -391,8 +434,10 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
           }
           return 'Okänt verktyg.';
         } catch (e) { return `Det gick inte: ${e.message}. Prova en annan sida eller sökning.`; }
-      }));
-      anrop.forEach((a, i) => msgs.push({ role: 'tool', tool_call_id: a.id, content: utfall[i] }));
+        })),
+        new Promise((resolve) => setTimeout(() => resolve(anrop.map(() => 'Det tog för lång tid. Svara med det du har hittat.')), verktygsSlut)),
+      ]);
+      anrop.forEach((a, i) => msgs.push({ role: 'tool', tool_call_id: a.id, content: neutral(utfall[i]) }));
     }
     // Ta bort inledande "Nu har jag tillräckligt … Låt mig sammanställa"-stycken
     if (svar) svar = svar.replace(/^(?:(?:Nu har jag|Jag har (?:nu )?(?:tillräckligt|bra|all)|Låt mig|Perfekt|Bra[,!])[^\n]*\n+)+/i, '').trim() || svar;
@@ -406,10 +451,17 @@ module.exports = ({ rutt, q, db, fel, kravInloggad, begransad, now }) => {
     return { reply: svar, sources, kvot: kvotUt(kv), modell: modellNyckel, ...(uppgradera ? { uppgradera } : {}) };
   }
 
+  // Neutralisera text som matas till modellen (verktygssvar): bryt styrsekvenser så att en sida Falk läser inte kan
+  // smuggla in egna verktygsanrop (samma som klientens neutral()).
+  function neutral(s) {
+    return String(s == null ? '' : s).replace(/\[\[/g, '[​[').replace(/<([｜|])(DSML|tool▁calls)/g, '<​$1$2');
+  }
   function dsmlAnrop(text) {
     const t = String(text || '');
     const start = t.search(/<[｜|]DSML[｜|]|<[｜|]tool▁calls/);
     if (start < 0) return { text: t.trim(), anrop: [] };
+    // Strunta i DSML inne i ett kodblock (```): då citerar modellen troligen en sida, inte ett eget verktygsanrop
+    if (((t.slice(0, start).match(/```/g) || []).length) % 2 === 1) return { text: t.trim(), anrop: [] };
     const anrop = [];
     for (const inv of t.slice(start).matchAll(/invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/[｜|]DSML[｜|]invoke>/g)) {
       const arg = {};

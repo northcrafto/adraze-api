@@ -53,25 +53,25 @@ module.exports = ({ rutt, q, db, fel, inloggad, kravInloggad, begransad, now, sh
   const stycken = (t) => esc(t).replace(/\n/g, '<br>');
 
   // ---------- mejl ----------
-  function mejlKund(a, typ, nyckel, svar) {
+  function mejlKund(a, typ, nyckel, svar, klass = 'drift') {
     const en = engelska(a.sprak);
     const knapp = `<tr><td align="center" style="padding-top:26px"><a href="${lank(nyckel, a.sprak)}" style="display:inline-block;background:#17171a;color:#ffffff;text-decoration:none;font-weight:600;font-size:15px;padding:14px 26px;border-radius:999px">${en ? 'Open your case' : 'Öppna ärendet'}</a></td></tr>`;
     if (typ === 'mottaget') {
       const rubrik = en ? `We got your message (#${a.nr})` : `Vi har fått ditt meddelande (#${a.nr})`;
       const t = en ? 'Thanks for writing to AdRaze. We reply as fast as we can, and you will get an email when we do. Keep this email: the button takes you back to your case.' : 'Tack för att du hörde av dig till AdRaze. Vi svarar så snabbt vi kan, och du får ett mejl när vi har gjort det. Spara mejlet: knappen tar dig tillbaka till ärendet.';
-      return skickaMejl(a.email, rubrik, mejlLayout(rubrik, mejlText(esc(t)) + mejlText(`<b>${esc(a.amne)}</b>`) + knapp), `${t}\n\n${lank(nyckel, a.sprak)}`, undefined, 'drift');
+      return skickaMejl(a.email, rubrik, mejlLayout(rubrik, mejlText(esc(t)) + mejlText(`<b>${esc(a.amne)}</b>`) + knapp), `${t}\n\n${lank(nyckel, a.sprak)}`, undefined, klass);
     }
     const rubrik = en ? `New reply on your case #${a.nr}` : `Nytt svar i ditt ärende #${a.nr}`;
     const citat = `<tr><td style="padding-top:22px"><div style="border-radius:12px;background:#f6f6f3;padding:16px 18px;font-size:15px;line-height:1.65;color:#17171a">${stycken(svar)}</div></td></tr>`;
     // Teamets svar räknas mot kontobudgeten, så att en flod av nya ärenden inte kan stoppa svaren
     return skickaMejl(a.email, rubrik, mejlLayout(rubrik, citat + knapp), `${svar}\n\n${en ? 'Reply here' : 'Svara här'}: ${lank(nyckel, a.sprak)}`, undefined, 'konto');
   }
-  function mejlTeam(a, text, nytt) {
+  function mejlTeam(a, text, nytt, klass = 'drift') {
     const rubrik = `${nytt ? 'Nytt supportärende' : 'Nytt svar från kunden'} #${a.nr}: ${a.amne}`.slice(0, 160);
     const html = mejlLayout(rubrik, mejlText(`${esc(a.namn || a.email)} &lt;${esc(a.email)}&gt;<br>Kategori: ${esc(a.kategori)}`)
       + `<tr><td style="padding-top:22px"><div style="border-radius:12px;background:#f6f6f3;padding:16px 18px;font-size:15px;line-height:1.65;color:#17171a">${stycken(text)}</div></td></tr>`
       + `<tr><td align="center" style="padding-top:26px"><a href="${SAJT}/team#${a.nr}" style="display:inline-block;background:#ff4b1f;color:#17171a;text-decoration:none;font-weight:600;font-size:15px;padding:14px 26px;border-radius:999px">Svara i teampanelen</a></td></tr>`);
-    return skickaMejl(TILL, rubrik, html, `${a.namn || ''} <${a.email}>\n${a.kategori}\n\n${text}\n\n${SAJT}/team#${a.nr}`, a.email, 'drift');
+    return skickaMejl(TILL, rubrik, html, `${a.namn || ''} <${a.email}>\n${a.kategori}\n\n${text}\n\n${SAJT}/team#${a.nr}`, a.email, klass);
   }
 
   // ---------- kunden ----------
@@ -95,8 +95,12 @@ module.exports = ({ rutt, q, db, fel, inloggad, kravInloggad, begransad, now, sh
       .run(nr, sha(nyckel), email, namn || (u?.namn || ''), u ? u.id : null, kategori, amne, sprak, ip, t, t, t);
     q('INSERT INTO support_meddelanden(arende_id,fran,namn,text,skapad) VALUES(?,?,?,?,?)').run(r.lastInsertRowid, 'kund', namn, text, t);
     const a = q('SELECT * FROM support_arenden WHERE id=?').get(r.lastInsertRowid);
-    await Promise.all([mejlKund(a, 'mottaget', nyckel), mejlTeam(a, text, true)]);
-    return { nr: a.nr, nyckel };
+    // Anonyma ärenden får egen, lägre mejlklass skild från drift, så de inte kan tömma driftbudgeten
+    const klass = u ? 'drift' : 'support';
+    await Promise.all([mejlKund(a, 'mottaget', nyckel, undefined, klass), mejlTeam(a, text, true, klass)]);
+    // Ge inte ut nyckeln i svaret till anonyma skapare: den går bara i mejlet till adressen, så att ingen kan
+    // öppna ett ärende i någon annans namn och läsa teamets svar utan att komma åt adressens inkorg.
+    return { nr: a.nr, ...(u ? { nyckel } : {}) };
   });
 
   // Nyckeln skickas i kroppen (inte i adressen) så att den aldrig hamnar i loggar
@@ -114,7 +118,7 @@ module.exports = ({ rutt, q, db, fel, inloggad, kravInloggad, begransad, now, sh
     const t = now();
     q('INSERT INTO support_meddelanden(arende_id,fran,namn,text,skapad) VALUES(?,?,?,?,?)').run(a.id, 'kund', a.namn, text, t);
     q("UPDATE support_arenden SET status='oppen', uppdaterad=?, last_kund=? WHERE id=?").run(t, t, a.id);
-    await mejlTeam(a, text, false);
+    await mejlTeam(a, text, false, a.user_id ? 'drift' : 'support');
     return { arende: ut(q('SELECT * FROM support_arenden WHERE id=?').get(a.id)) };
   });
 
@@ -165,7 +169,8 @@ module.exports = ({ rutt, q, db, fel, inloggad, kravInloggad, begransad, now, sh
     if (!a) throw fel(404, 'Ärendet finns inte.');
     return a;
   };
-  const teamUt = (a) => ({ ...ut(a), email: a.email, namn: a.namn, sprak: a.sprak, konto: !!a.user_id });
+  // epost_verifierad=false ⇒ ärendet skapades utan inloggning; teampanelen kan visa tydligt att adressen inte är bekräftad
+  const teamUt = (a) => ({ ...ut(a), email: a.email, namn: a.namn, sprak: a.sprak, konto: !!a.user_id, epost_verifierad: !!a.user_id });
   rutt('POST', '/support/team/arende', async (req, res, b) => { kravTeam(req); return { arende: teamUt(teamArende(b.nr)) }; });
   rutt('POST', '/support/team/svara', async (req, res, b) => {
     const u = kravTeam(req);

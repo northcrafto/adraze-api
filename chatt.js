@@ -846,15 +846,17 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad: krav
     const u = q('SELECT p.user_id, p.username, p.public_key, a.avatar FROM chatt_profiler p JOIN users a ON a.id=p.user_id WHERE p.username_lower=?').get(uname);
     if (!u || (u.user_id !== me && (isBlockedEither(me, u.user_id) || !familjOk(me, u.user_id)))) return { exists: false };   // barn syns bara för sin familj
     const nara = u.user_id === me || areContacts(me, u.user_id);
-    return { exists: true, id: idUt(u.user_id), username: u.username, public_key: nara ? u.public_key : null, avatar: nara ? (u.avatar || null) : null };
+    // Lämna bara ut det interna id:t (löpnummer, samma som synk/support/Pro) till kontakter. Förfrågningar går på namn.
+    const grund = { exists: true, username: u.username, public_key: nara ? u.public_key : null, avatar: nara ? (u.avatar || null) : null };
+    return nara ? { ...grund, id: idUt(u.user_id) } : grund;
   });
 
   rutt('GET', '/chatt/users/key', (req, res) => {
     const me = profil(req, res).id;
     const id = idIn(query(req).get('id'));
     const u = id && q('SELECT p.user_id, p.username, p.public_key, a.avatar FROM chatt_profiler p JOIN users a ON a.id=p.user_id WHERE p.user_id=?').get(id);
-    if (!u) throw E(res, 404, 'not_found');
-    if (u.user_id !== me && !areContacts(me, u.user_id)) throw E(res, 403, 'not_contacts');
+    // Samma svar (404) för id utan profil som för id som inte är kontakt, så att man inte kan räkna upp vilka id som har chatt
+    if (!u || (u.user_id !== me && !areContacts(me, u.user_id))) throw E(res, 404, 'not_found');
     return { id: idUt(u.user_id), username: u.username, public_key: u.public_key, avatar: u.avatar || null };
   });
 
@@ -1148,6 +1150,8 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad: krav
     const { id, m } = egetDm(res, me, b);
     if (!m) throw E(res, 404, 'not_found');
     if (m.sender_id !== me) throw E(res, 403, 'not_sender', 'Du kan bara andra dina egna meddelanden.');
+    // En blockerad/borttagen kontakt får inte skriva om historiken som mottagaren vill ha kvar
+    if (!areContacts(me, m.recipient_id)) throw E(res, 403, 'not_contacts', 'Ni är inte kontakter.');
     if (m.deleted_at) throw E(res, 400, 'already_deleted');
     q('UPDATE chatt_meddelanden SET ciphertext=?, edited_at=? WHERE id=?').run(b.ciphertext, now(), id);
     return {};
@@ -1157,6 +1161,8 @@ module.exports = function registreraChatt({ rutt, q, db, fel, kravInloggad: krav
     const { id, m } = egetDm(res, me, b);
     if (!m) throw E(res, 404, 'not_found');
     if (m.sender_id !== me) throw E(res, 403, 'not_sender', 'Du kan bara ta bort dina egna meddelanden.');
+    // En blockerad/borttagen kontakt får inte radera historiken som mottagaren vill ha kvar
+    if (!areContacts(me, m.recipient_id)) throw E(res, 403, 'not_contacts', 'Ni är inte kontakter.');
     q("UPDATE chatt_meddelanden SET ciphertext='', deleted_at=? WHERE id=?").run(now(), id);
     dropAttachment(m.attachment_id);
     return {};
