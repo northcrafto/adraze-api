@@ -772,6 +772,44 @@ rutt('POST', '/barn/logout', (req) => {
   return {};
 });
 
+// ── Översätt sidan (AdRaze-webbläsaren) ──
+// Webbläsaren skickar sidans textbitar hit och vi frågar Googles översättning åt den, så att Google ser vår server och
+// inte användaren. Inget loggas och inget sparas på disk: bara en minnescache per (språk, text), så att samma meny och
+// sidfot inte översätts om för varje sida. Ingen inloggning krävs. Tak per adress och för alla per dygn.
+const OVS_SPRAK = /^[a-z]{2,3}(-[A-Za-z]{2,4})?$/;
+const ovsCache = new Map(); const OVS_CACHE_MAX = 30_000;
+let ovsDag = '', ovsAntal = 0;
+async function ovsGoogle(texter, till) {
+  const u = 'https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl=' + encodeURIComponent(till) + '&' + texter.map((t) => 'q=' + encodeURIComponent(t)).join('&');
+  const r = await fetch(u, { headers: { 'User-Agent': 'Mozilla/5.0', Accept: '*/*' }, signal: AbortSignal.timeout(15_000) });
+  if (r.status === 429 || r.status === 503) throw fel(503, 'Översättningen är överbelastad just nu. Försök igen om en stund.');
+  if (!r.ok) throw fel(502, 'Översättningen svarade inte.');
+  const j = await r.json();
+  if (!Array.isArray(j) || j.length !== texter.length) throw fel(502, 'Översättningen gav ett oväntat svar.');
+  return j.map((x) => (Array.isArray(x) ? { text: String(x[0] ?? ''), fran: String(x[1] || '') } : { text: String(x ?? ''), fran: '' }));
+}
+rutt('POST', '/oversatt', async (req, res, b) => {
+  const till = String(b.till || '');
+  if (!OVS_SPRAK.test(till)) throw fel(400, 'Okänt språk.');
+  const texter = Array.isArray(b.texter) ? b.texter : null;
+  if (!texter || !texter.length || texter.length > 40 || texter.some((t) => typeof t !== 'string' || !t.trim() || t.length > 2000)) throw fel(400, 'Fel på texterna.');
+  if (texter.reduce((n, t) => n + t.length, 0) > 4000) throw fel(413, 'För mycket text på en gång.');
+  if (begransad(`ovs:${ipAv(req)}`, 900, 600_000)) throw fel(429, 'För många översättningar på kort tid. Vänta en stund.');
+  const dag = new Date().toISOString().slice(0, 10);
+  if (dag !== ovsDag) { ovsDag = dag; ovsAntal = 0; }
+  const ut = new Array(texter.length); const saknas = [];
+  texter.forEach((t, i) => { const c = ovsCache.get(till + '\n' + t); if (c) ut[i] = c; else saknas.push(i); });
+  // Googles adress tar frågan i webbadressen: dela upp så att varje anrop håller sig kort
+  for (let a = 0; a < saknas.length;) {
+    const bit = []; let langd = 0;
+    while (a < saknas.length && (!bit.length || langd + encodeURIComponent(texter[saknas[a]]).length < 5200)) { langd += encodeURIComponent(texter[saknas[a]]).length + 3; bit.push(saknas[a++]); }
+    if (++ovsAntal > Number(process.env.OVS_DAG_TAK || 150_000)) throw fel(503, 'Översättningen har nått dagens tak. Försök igen i morgon.');
+    const svar = await ovsGoogle(bit.map((i) => texter[i]), till);
+    bit.forEach((i, n) => { ut[i] = svar[n]; if (ovsCache.size >= OVS_CACHE_MAX) ovsCache.delete(ovsCache.keys().next().value); ovsCache.set(till + '\n' + texter[i], svar[n]); });
+  }
+  return { texter: ut.map((x) => x.text), fran: ut.map((x) => x.fran) };
+});
+
 // ── Barnlås ──
 // Föräldern (inloggad) låser den här webbläsaren till ett av sina barn: barnet loggas in direkt, utan barnkod och mejlad kod,
 // eftersom det är föräldern själv som sitter vid datorn. Svaret bär också låsets märkning.

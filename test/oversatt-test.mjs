@@ -1,0 +1,30 @@
+// Översätt sidan: /oversatt mot Googles översättning (riktiga anrop, några få). Tillfällig kopia av adraze-api.
+// Kör: node test/oversatt-test.mjs
+import { spawn } from 'node:child_process';
+import fs from 'node:fs'; import os from 'node:os'; import path from 'node:path'; import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const PORT = Number(process.env.TEST_PORT || 18498), BAS = `http://127.0.0.1:${PORT}`;
+const tmp = fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), 'adraze-ovs-'));
+for (const f of fs.readdirSync(REPO)) if (f.endsWith('.js')) fs.copyFileSync(path.join(REPO, f), path.join(tmp, f));
+const srv = spawn(process.execPath, [path.join(tmp, 'server.js')], { cwd: tmp, env: { ...process.env, PORT: String(PORT), MAIL_LOGG: '1', CHATT_HOTLISTOR: '0', BREVO_API_KEY: '', CLAMD_PORT: '1', CHATT_NYCKEL: crypto.randomBytes(32).toString('hex') }, stdio: ['ignore', 'pipe', 'pipe'] });
+let logg = ''; srv.stdout.on('data', (d) => { logg += d; }); srv.stderr.on('data', (d) => { logg += d; });
+process.on('exit', () => { try { srv.kill(); } catch {} try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {} });
+for (let i = 0; i < 100 && !logg.includes('adraze-api på'); i++) await new Promise((r) => setTimeout(r, 50));
+const api = async (kropp) => { const r = await fetch(BAS + '/oversatt', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(kropp) }); return { status: r.status, ...(await r.json().catch(() => ({}))) }; };
+let ok = 0, fel = 0; const koll = (n, v, info) => { if (v) { ok++; console.log('  ok  ' + n); } else { fel++; console.log('  FEL ' + n, info ? JSON.stringify(info).slice(0, 200) : ''); } };
+let r = await api({ till: 'sv', texter: ['Hello world', 'Good morning, how are you?'] });
+koll('två meningar till svenska, i samma ordning', r.ok && r.texter.length === 2 && /världen/i.test(r.texter[0]) && /morgon/i.test(r.texter[1]), r);
+koll('källspråket följer med', r.ok && r.fran[0] === 'en', r);
+const fore = Date.now(); r = await api({ till: 'sv', texter: ['Hello world'] });
+koll('samma text igen kommer ur cachen', r.ok && /världen/i.test(r.texter[0]) && Date.now() - fore < 60);
+r = await api({ till: 'de', texter: ['Hello world'] }); koll('annat språk översätts för sig', r.ok && /Welt/i.test(r.texter[0]), r);
+r = await api({ till: 'sv', texter: Array.from({ length: 30 }, (_, i) => `This is sentence number ${i + 1} on a fairly long page with a lot of text in it, repeated so that the request has to be split.`) });
+koll('lång omgång delas upp och kommer tillbaka hel', r.ok && r.texter.length === 30 && r.texter.every((t, i) => t.includes(String(i + 1))), r.status);
+koll('okänt språk nekas', (await api({ till: '../x', texter: ['a'] })).status === 400);
+koll('tom lista nekas', (await api({ till: 'sv', texter: [] })).status === 400);
+koll('för många texter nekas', (await api({ till: 'sv', texter: Array(41).fill('hej') })).status === 400);
+koll('för mycket text nekas', (await api({ till: 'sv', texter: Array(5).fill('x'.repeat(1000)) })).status === 413);
+koll('fel typ nekas', (await api({ till: 'sv', texter: [1, 2] })).status === 400);
+koll('inget av texten hamnar i loggen', !/Hello world|sentence number/.test(logg));
+console.log(`\n${ok} ok, ${fel} fel`); process.exit(fel ? 1 : 0);
