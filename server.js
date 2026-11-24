@@ -78,6 +78,10 @@ CREATE TABLE IF NOT EXISTS barn_fragor(id INTEGER PRIMARY KEY, barn_id TEXT NOT 
   host TEXT NOT NULL, text TEXT, skapad INTEGER NOT NULL, svar TEXT, minuter INTEGER, svarad INTEGER);
 CREATE INDEX IF NOT EXISTS barn_fragor_barn ON barn_fragor(barn_id, skapad);
 CREATE TABLE IF NOT EXISTS barn_enheter(token TEXT PRIMARY KEY, barn_id TEXT NOT NULL REFERENCES barn(id) ON DELETE CASCADE, skapad INTEGER NOT NULL);`);
+// Barnlås: föräldern låser en webbläsare till barnets konto. Låset får en egen märkning (token) som följer webbläsaren.
+// Lösenordet till låset finns bara på datorn; märkningen används när föräldern glömt det och behöver en kod för att välja ett nytt.
+db.exec(`CREATE TABLE IF NOT EXISTS barn_las(token TEXT PRIMARY KEY, barn_id TEXT NOT NULL REFERENCES barn(id) ON DELETE CASCADE, skapad INTEGER NOT NULL,
+  kod_hash TEXT, kod_tries INTEGER NOT NULL DEFAULT 0, kod_expires INTEGER NOT NULL DEFAULT 0, kod_sent INTEGER NOT NULL DEFAULT 0);`);
 // Spärrljud: föräldern kan välja ett ljud som spelas när barnet hamnar på en spärrad sida (av från början)
 if (!q("SELECT 1 FROM pragma_table_info('barn') WHERE name='sparrljud'").get()) db.exec("ALTER TABLE barn ADD COLUMN sparrljud TEXT NOT NULL DEFAULT ''");
 if (!q("SELECT 1 FROM pragma_table_info('barn') WHERE name='sparrljud_vol'").get()) db.exec('ALTER TABLE barn ADD COLUMN sparrljud_vol INTEGER NOT NULL DEFAULT 60');
@@ -765,6 +769,65 @@ rutt('POST', '/barn/historik', (req, res, b) => {
 rutt('POST', '/barn/logout', (req) => {
   const t = bearer(req);
   if (t) q('DELETE FROM barn_sessioner WHERE token=?').run(sha(t));
+  return {};
+});
+
+// ── Barnlås ──
+// Föräldern (inloggad) låser den här webbläsaren till ett av sina barn: barnet loggas in direkt, utan barnkod och mejlad kod,
+// eftersom det är föräldern själv som sitter vid datorn. Svaret bär också låsets märkning.
+rutt('POST', '/familj/las', (req, res, b) => {
+  const u = kravInloggad(req);
+  const barn = ettBarn(u, b.barn_id);
+  if (begransad(`las:${u.id}`, 20, 3_600_000)) throw fel(429, 'För många försök. Vänta en stund.');
+  const t = crypto.randomBytes(32).toString('base64url'), las = crypto.randomBytes(32).toString('base64url');
+  q('INSERT INTO barn_sessioner(token,barn_id,ip,skapad,senast,expires) VALUES(?,?,?,?,?,?)').run(sha(t), barn.id, ipAv(req), now(), now(), now() + BARN_DAGAR * 86_400_000);
+  q('DELETE FROM barn_sessioner WHERE barn_id=? AND token NOT IN (SELECT token FROM barn_sessioner WHERE barn_id=? ORDER BY skapad DESC LIMIT ?)').run(barn.id, barn.id, BARN_SESSIONER);
+  q('INSERT INTO barn_las(token,barn_id,skapad) VALUES(?,?,?)').run(sha(las), barn.id, now());
+  q('DELETE FROM barn_las WHERE barn_id=? AND token NOT IN (SELECT token FROM barn_las WHERE barn_id=? ORDER BY skapad DESC LIMIT 20)').run(barn.id, barn.id);
+  q('UPDATE barn SET senast=? WHERE id=?').run(now(), barn.id);
+  return { token: t, las, barn: { id: barn.id, namn: barn.namn, alder: barn.alder } };
+});
+const lasRad = (las) => {
+  const r = typeof las === 'string' && las.length >= 20 && q('SELECT l.*, b.namn, b.foralder_id FROM barn_las l JOIN barn b ON b.id=l.barn_id WHERE l.token=?').get(sha(las));
+  if (!r) throw fel(404, 'Låset finns inte längre. Logga in som förälder för att ta bort det.');
+  return r;
+};
+const lasMejl = (namn, kod) => ({
+  amne: `${kod} – nytt lösenord till barnlåset i AdRaze`,
+  html: mejlLayout('Nytt lösenord till barnlåset', mejlText(`Någon vill välja ett nytt lösenord till barnlåset på <b style="color:#17171a">${esc(namn)}</b>s AdRaze-webbläsare. Skriv koden i webbläsaren om det är du.`) +
+    mejlKod(kod) + mejlText('Koden gäller i 15 minuter och fungerar bara en gång.') +
+    mejlRuta(`<b>Var det inte du?</b> Då försöker någon låsa upp webbläsaren. Ge inte koden till ${esc(namn)}. Låset sitter kvar så länge ingen skriver in koden.`)),
+  text: `Någon vill välja ett nytt lösenord till barnlåset på ${namn}s AdRaze-webbläsare.\n\nKod: ${kod}\n\nSkriv koden i webbläsaren om det är du. Koden gäller i 15 minuter.\nVar det inte du? Ge inte koden till ${namn}. Låset sitter kvar.`,
+});
+// Glömt lösenordet till låset, steg 1: en kod mejlas till föräldern
+rutt('POST', '/barn/las-kod', async (req, res, b) => {
+  if (begransad(`laskod:${ipAv(req)}`, 15, 900_000)) throw fel(429, 'För många försök. Vänta en stund.');
+  const l = lasRad(b.las);
+  if (l.kod_sent && now() - l.kod_sent < 45_000) return { skickad: true };
+  if (begransadDb(`barnmejl:${l.foralder_id}`, 5, 86_400_000)) throw fel(429, 'Det har skickats många koder i dag. Försök igen i morgon.');
+  const foralder = q('SELECT email FROM users WHERE id=?').get(l.foralder_id);
+  const kod = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
+  const m = lasMejl(l.namn, kod);
+  if (!(await skickaMejl(foralder.email, m.amne, m.html, m.text, undefined, 'familj'))) throw fel(502, 'Vi kunde inte skicka koden just nu. Försök igen om en stund.');
+  q('UPDATE barn_las SET kod_hash=?, kod_tries=0, kod_expires=?, kod_sent=? WHERE token=?').run(hmac(`las:${l.token}:${kod}`), now() + KOD_TTL, now(), l.token);
+  return { skickad: true };
+});
+// Steg 2: koden stämmer → webbläsaren får välja ett nytt lösenord (det sparas bara där)
+rutt('POST', '/barn/las-verifiera', (req, res, b) => {
+  if (begransad(`lasverif:${ipAv(req)}`, 30, 900_000)) throw fel(429, 'För många försök. Vänta en stund.');
+  const l = lasRad(b.las);
+  if (!l.kod_hash || l.kod_expires < now()) throw fel(410, 'Koden har gått ut. Be om en ny.');
+  if (l.kod_tries >= 6) throw fel(429, 'För många fel försök. Be om en ny kod.');
+  if (typeof b.kod !== 'string' || !eq(hmac(`las:${l.token}:${b.kod.replace(/\s/g, '')}`), l.kod_hash)) {
+    q('UPDATE barn_las SET kod_tries=kod_tries+1 WHERE token=?').run(l.token);
+    throw fel(400, 'Fel kod. Kontrollera mejlet och försök igen.');
+  }
+  q('UPDATE barn_las SET kod_hash=NULL, kod_tries=0, kod_expires=0 WHERE token=?').run(l.token);
+  return { godkand: true };
+});
+// Låset är upplåst: märkningen tas bort
+rutt('POST', '/barn/las-bort', (req, res, b) => {
+  if (typeof b.las === 'string') q('DELETE FROM barn_las WHERE token=?').run(sha(b.las));
   return {};
 });
 
